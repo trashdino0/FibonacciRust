@@ -30,12 +30,50 @@ unless noted. Java: `fibonacci-1.0-SNAPSHOT.jar` on JDK 21.0.8, same machine.
 
 | n | decimal digits | Rust compute | Rust decimal | Java compute |
 |---|---------------|--------------|--------------|--------------|
-| 10⁴ | 2,090 | 0.3 ms | — | — |
-| 10⁵ | 20,899 | 6.3 ms | ~1 ms | ~5 ms steady-state |
-| 10⁶ | 208,988 | 28.7 ms | 19 ms | **CRASHES** (`add: overflow`) |
-| 10⁷ | 2,089,877 | 219 ms | 506 ms | **CRASHES** (same bug) |
-| 5·10⁷ | ~10,449,382 | ~2.3 s | — | **CRASHES** (same bug) |
-| 10⁸ | 20,898,764 | 4.53 s | 15.5 s | **CRASHES** (same bug) |
+| 10⁴ | 2,090 | 0.2 ms | — | — |
+| 10⁵ | 20,899 | 5.6 ms | ~1 ms | ~5 ms steady-state |
+| 10⁶ | 208,988 | 20.9 ms | ~20 ms | **CRASHES** (`add: overflow`) |
+| 10⁷ | 2,089,877 | 159 ms | ~0.52 s | **CRASHES** (same bug) |
+| 5·10⁷ | ~10,449,382 | 1.77 s | — | **CRASHES** (same bug) |
+| 10⁸ | 20,898,764 | ~3.7–4.6 s | ~17 s | **CRASHES** (same bug) |
+
+(Compute figures are means over 3–5 warmed runs; 10⁸ varies run-to-run under
+sustained all-core load. The Rust column already includes the optimizations
+below — pre-optimization compute was 28.7 ms / 245 ms / 2.31 s / 4.53 s for
+10⁶ / 10⁷ / 5·10⁷ / 10⁸.)
+
+### Optimization log (measured, release build, same machine)
+
+Method: warmed release runs (`-a 3–5 -w …`), one change at a time, `cargo test`
+plus full-output SHA256/modular verification after every change. No privileged
+profiler was available (Windows, unelevated), so phases were timed with
+temporary `Instant` guards (reverted afterwards) plus complexity analysis.
+
+Phase profile at F(10⁷): compute 0.22 s = forward NTT 0.18 + inverse NTT
+0.26 + pointwise/Garner/alloc ≈ 0.06 (thread-seconds — NTT ≈ 85%, allocation
+churn ≈ 2%, so pooling/allocator swaps were skipped on evidence); decimal
+0.55 s = top-level `div_rem` 0.26 serial + deeper splits + `10^k` pow 0.15.
+
+1. **Integer Barrett `mulmod` (kept): 1.3–1.6× compute.** The butterfly's
+   `f64`-quotient estimate chained an `f64` multiply plus a `cvttsd2si`
+   float→int conversion per operation. Replaced with `q̂ = (x·μ) >> 64`,
+   `μ = ⌈2⁶⁴/p⌉` — pure integer, same ±1 single-fix-up contract, validated by
+   the 20k×3 u128-oracle test plus end-to-end hashes. Compute: 28.7→20.9 ms
+   (10⁶), 245→159 ms (10⁷), 2.31→1.77 s (5·10⁷). Decimal unchanged (it is
+   dominated by num-bigint division, untouched).
+2. **`pow10` via our NTT core (reverted — measured worse).** Binary
+   exponentiation through our multiply: 184 ms vs num-bigint `pow` 48 ms for
+   10^1044938 in isolation; end-to-end decimal regressed 0.58→0.88 s.
+   Head-to-head showed our single multiply (126 ms @100k limbs) trailing
+   num-bigint's Karatsuba (94 ms) — our 3-prime NTT constants only pay off at
+   larger sizes. Reverted in full; lesson preserved here instead of in code.
+3. **Not pursued, with reasons:** `ibig::to_string` as decimal backend
+   (846 ms vs our parallel 621 ms @10⁷ — its Display doesn't beat parallel
+   D&C); Barrett division for the top `div_rem` (≈3 mults + Newton-μ ≈ 10
+   mults ≈ 780 ms vs current 250 ms — needs a faster multiply first, see 2);
+   GMP/`rug` (no C toolchain on this machine — no vcpkg/MSYS/MinGW);
+   cache-blocked NTT and buffer pooling (profile says bandwidth-bound with
+   negligible alloc share — diminishing returns, stated plainly).
 
 Correctness: full decimal strings hashed against Python (`hashlib.sha256`):
 F(10⁵), F(2·10⁵) (also vs Java where it runs), F(10⁶), F(10⁷) — all identical.
