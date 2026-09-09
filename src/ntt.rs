@@ -23,9 +23,13 @@
 //! * Layered root-of-unity tables: the inner loop reads
 //!   `roots[len], roots[len+1], ...` sequentially (prefetcher-friendly) and
 //!   the per-butterfly `w = w * wlen % p` update disappears entirely.
+//! * NTT working arrays and root tables are `u32`, not `u64`: every stored
+//!   value is `< 2^32` by the laziness invariant, so this halves streaming
+//!   traffic (the top transform touches 16 MB instead of 32 MB per pass) while
+//!   all arithmetic still happens in `u64` locals.
 //! * Tables are built once and shared via `Arc` (Java used a
-//!   `ConcurrentHashMap`); cloning the `Arc` is pointer-sized, the 64 MiB
-//!   tables themselves are never copied.
+//!   `ConcurrentHashMap`); cloning the `Arc` is pointer-sized, the tables
+//!   themselves are never copied.
 
 /// Bottleneck prime P1 supports transforms up to 2^23.
 pub const MAX_LOG_N: u32 = 23;
@@ -56,9 +60,9 @@ pub const INV_P3: f64 = 1.0 / P3 as f64;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, RwLock};
 
-static FWD_CACHE: LazyLock<RwLock<HashMap<u32, Arc<Vec<u64>>>>> =
+static FWD_CACHE: LazyLock<RwLock<HashMap<u32, Arc<Vec<u32>>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
-static INV_CACHE: LazyLock<RwLock<HashMap<u32, Arc<Vec<u64>>>>> =
+static INV_CACHE: LazyLock<RwLock<HashMap<u32, Arc<Vec<u32>>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 static NINV_CACHE: LazyLock<RwLock<HashMap<u32, u64>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
@@ -129,14 +133,15 @@ pub fn mod_inverse(n: u64, modu: u64) -> u64 {
     powmod(n, modu - 2, modu)
 }
 
-/// Layered root table for a DIT NTT of size `2^log_n`.
+/// Layered root table for a DIT NTT of size `2^log_n`, stored as `u32`
+/// (every root is `< p < 2^30`).
 ///
 /// Layout (`i` in `[1, 2^log_n)`): `roots[1] = 1`, and for each
 /// `k = 2, 4, 8, ..., n/2`: `roots[k] = roots[k/2]`,
 /// `roots[k+j] = roots[k+j-1] * e` for `j = 1..k`, where
 /// `e = g^((p-1)/(2k))` is the primitive `(2k)`-th root of unity.
 /// Inverse tables use `g^-1` as generator.
-fn build_roots(log_n: u32, pi: usize, inverse: bool) -> Vec<u64> {
+fn build_roots(log_n: u32, pi: usize, inverse: bool) -> Vec<u32> {
     let n = 1usize << log_n;
     let p = PRIMES[pi];
     let mut g = G;
@@ -145,7 +150,7 @@ fn build_roots(log_n: u32, pi: usize, inverse: bool) -> Vec<u64> {
     }
     let mu = MU_PRIMES[pi];
 
-    let mut rt = vec![0u64; n.max(2)];
+    let mut rt = vec![0u32; n.max(2)];
     rt[1] = 1;
     let mut k = 2usize;
     while k < n {
@@ -154,7 +159,7 @@ fn build_roots(log_n: u32, pi: usize, inverse: bool) -> Vec<u64> {
             rt[i] = if i & 1 == 0 {
                 rt[i >> 1]
             } else {
-                mulmod(rt[i - 1], e, p, mu)
+                mulmod(rt[i - 1] as u64, e, p, mu) as u32
             };
         }
         k <<= 1;
@@ -163,7 +168,7 @@ fn build_roots(log_n: u32, pi: usize, inverse: bool) -> Vec<u64> {
 }
 
 /// Forward root table for size `2^log_n`, prime `pi` (shared `Arc`, cheap to clone).
-pub fn fwd_roots(log_n: u32, pi: usize) -> Arc<Vec<u64>> {
+pub fn fwd_roots(log_n: u32, pi: usize) -> Arc<Vec<u32>> {
     let key = cache_key(log_n, pi);
     if let Some(hit) = FWD_CACHE.read().expect("lock").get(&key) {
         return Arc::clone(hit);
@@ -177,7 +182,7 @@ pub fn fwd_roots(log_n: u32, pi: usize) -> Arc<Vec<u64>> {
 }
 
 /// Inverse root table (built from `g^-1`).
-pub fn inv_roots(log_n: u32, pi: usize) -> Arc<Vec<u64>> {
+pub fn inv_roots(log_n: u32, pi: usize) -> Arc<Vec<u32>> {
     let key = cache_key(log_n, pi);
     if let Some(hit) = INV_CACHE.read().expect("lock").get(&key) {
         return Arc::clone(hit);
@@ -215,7 +220,7 @@ pub fn prewarm() {
 }
 
 /// Bit-reversal permutation, amortised O(n) via the binary-counter trick.
-fn bit_rev(a: &mut [u64]) {
+fn bit_rev<T>(a: &mut [T]) {
     let n = a.len();
     let mut j = 0usize;
     for i in 1..n {
@@ -232,7 +237,8 @@ fn bit_rev(a: &mut [u64]) {
 }
 
 /// Forward in-place NTT. `data` must have length exactly `2^log_n`.
-pub fn ntt_forward(data: &mut [u64], log_n: u32, pi: usize) {
+/// Stored values stay `< 2^32` (laziness invariant); arithmetic is `u64`.
+pub fn ntt_forward(data: &mut [u32], log_n: u32, pi: usize) {
     if log_n == 0 {
         return;
     }
@@ -250,11 +256,11 @@ pub fn ntt_forward(data: &mut [u64], log_n: u32, pi: usize) {
         let mut i = 0usize;
         while i < n {
             for j in 0..len {
-                let u = data[i + j];
-                let v = mulmod(data[i + j + len], rt[len + j], p, mu);
+                let u = data[i + j] as u64;
+                let v = mulmod(data[i + j + len] as u64, rt[len + j] as u64, p, mu);
                 let sum = u + v;
-                data[i + j] = if sum >= p { sum - p } else { sum };
-                data[i + j + len] = if u < v { u + p - v } else { u - v };
+                data[i + j] = (if sum >= p { sum - p } else { sum }) as u32;
+                data[i + j + len] = (if u < v { u + p - v } else { u - v }) as u32;
             }
             i += two;
         }
@@ -263,7 +269,7 @@ pub fn ntt_forward(data: &mut [u64], log_n: u32, pi: usize) {
 }
 
 /// Inverse in-place NTT (includes `1/n` scaling).
-pub fn ntt_inverse(data: &mut [u64], log_n: u32, pi: usize) {
+pub fn ntt_inverse(data: &mut [u32], log_n: u32, pi: usize) {
     if log_n == 0 {
         return;
     }
@@ -282,11 +288,11 @@ pub fn ntt_inverse(data: &mut [u64], log_n: u32, pi: usize) {
         let mut i = 0usize;
         while i < n {
             for j in 0..len {
-                let u = data[i + j];
-                let v = mulmod(data[i + j + len], rt[len + j], p, mu);
+                let u = data[i + j] as u64;
+                let v = mulmod(data[i + j + len] as u64, rt[len + j] as u64, p, mu);
                 let sum = u + v;
-                data[i + j] = if sum >= p { sum - p } else { sum };
-                data[i + j + len] = if u < v { u + p - v } else { u - v };
+                data[i + j] = (if sum >= p { sum - p } else { sum }) as u32;
+                data[i + j + len] = (if u < v { u + p - v } else { u - v }) as u32;
             }
             i += two;
         }
@@ -294,7 +300,7 @@ pub fn ntt_inverse(data: &mut [u64], log_n: u32, pi: usize) {
     }
 
     for v in data.iter_mut() {
-        *v = mulmod(*v, ni, p, mu);
+        *v = mulmod(*v as u64, ni, p, mu) as u32;
     }
 }
 
@@ -349,7 +355,7 @@ mod tests {
         for log_n in [1u32, 2, 4, 8, 12] {
             for (pi, &p) in PRIMES.iter().enumerate() {
                 let n = 1usize << log_n;
-                let mut v: Vec<u64> = (0..n as u64).map(|i| (i * 7 + 1) % p).collect();
+                let mut v: Vec<u32> = (0..n as u64).map(|i| ((i * 7 + 1) % p) as u32).collect();
                 let orig = v.clone();
                 ntt_forward(&mut v, log_n, pi);
                 assert_ne!(v, orig, "forward should change data");

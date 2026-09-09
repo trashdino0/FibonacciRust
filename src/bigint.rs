@@ -216,17 +216,16 @@ impl BigInt {
     }
 
     /// Copy limbs into the low words of `dst` (rest of `dst` stays zero —
-    /// `dst` is always freshly allocated, so no garbage to clear).
-    fn fill_u64(src: &Self, dst: &mut [u64]) {
-        for (d, &w) in dst.iter_mut().zip(src.mag[..src.len].iter()) {
-            *d = w as u64;
-        }
+    /// `dst` is always freshly allocated, so no garbage to clear). Same
+    /// element type as the limbs, so this is one `memcpy`.
+    fn fill_u32(src: &Self, dst: &mut [u32]) {
+        dst[..src.len].copy_from_slice(&src.mag[..src.len]);
     }
 
     /// Garner CRT: combine residues `r1/r2/r3` (length `n`) into `out`.
     /// Bit-for-bit the Java `garnerCRT`, including the two-stage correction
     /// of the double-based `partial % P3`.
-    fn garner(r1: &[u64], r2: &[u64], r3: &[u64], n: usize) -> Self {
+    fn garner(r1: &[u32], r2: &[u32], r3: &[u32], n: usize) -> Self {
         let p1 = ntt::P1;
         let p2 = ntt::P2;
         let p3 = ntt::P3;
@@ -240,7 +239,7 @@ impl BigInt {
         let mut mag = vec![0u32; n + 2];
         let mut carry = 0u64;
         for i in 0..n {
-            let v1 = r1[i];
+            let v1 = r1[i] as u64;
             // BUG FIX vs `MutableBigInt.garnerCRT`: it reduces `(r2 - r1) mod P2`
             // with a single `if (diff < 0) diff += p2`, but `r1 < P1` can exceed
             // `r2 + P2` (P1 ~= 6x P2), leaving `diff2` negative — which its
@@ -307,18 +306,18 @@ impl BigInt {
     /// in and out — no shared mutable state, no locks on the hot path.
     #[cfg(test)]
     fn mul_ntt(a: &Self, b: &Self, log_n: u32, n: usize) -> Self {
-        let build = |pi: usize| -> Vec<u64> {
-            let mut fa = vec![0u64; n];
-            let mut fb = vec![0u64; n];
-            Self::fill_u64(a, &mut fa);
-            Self::fill_u64(b, &mut fb);
+        let build = |pi: usize| -> Vec<u32> {
+            let mut fa = vec![0u32; n];
+            let mut fb = vec![0u32; n];
+            Self::fill_u32(a, &mut fa);
+            Self::fill_u32(b, &mut fb);
             ntt::ntt_forward(&mut fa, log_n, pi);
             ntt::ntt_forward(&mut fb, log_n, pi);
             let p = ntt::PRIMES[pi];
             let mu = [ntt::MU_P1, ntt::MU_P2, ntt::MU_P3][pi];
-            let mut r = vec![0u64; n];
+            let mut r = vec![0u32; n];
             for i in 0..n {
-                r[i] = ntt::mulmod(fa[i], fb[i], p, mu);
+                r[i] = ntt::mulmod(fa[i] as u64, fb[i] as u64, p, mu) as u32;
             }
             ntt::ntt_inverse(&mut r, log_n, pi);
             r
@@ -341,11 +340,11 @@ impl BigInt {
     /// `a`, `b` compute `a^2`, `b^2`, `a*b` in the NTT domain, then invert.
     /// Owns its buffers; returns the three residue vectors.
     fn double_track(
-        mut fa: Vec<u64>,
-        mut fb: Vec<u64>,
+        mut fa: Vec<u32>,
+        mut fb: Vec<u32>,
         log_n: u32,
         pi: usize,
-    ) -> (Vec<u64>, Vec<u64>, Vec<u64>) {
+    ) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
         let p = ntt::PRIMES[pi];
         let mu = [ntt::MU_P1, ntt::MU_P2, ntt::MU_P3][pi];
         let n = fa.len();
@@ -361,15 +360,15 @@ impl BigInt {
             ntt::ntt_forward(&mut fb, log_n, pi);
         }
 
-        let mut ra = vec![0u64; n];
-        let mut rb = vec![0u64; n];
-        let mut rab = vec![0u64; n];
+        let mut ra = vec![0u32; n];
+        let mut rb = vec![0u32; n];
+        let mut rab = vec![0u32; n];
         for i in 0..n {
-            let ai = fa[i];
-            let bi = fb[i];
-            ra[i] = ntt::mulmod(ai, ai, p, mu);
-            rb[i] = ntt::mulmod(bi, bi, p, mu);
-            rab[i] = ntt::mulmod(ai, bi, p, mu);
+            let ai = fa[i] as u64;
+            let bi = fb[i] as u64;
+            ra[i] = ntt::mulmod(ai, ai, p, mu) as u32;
+            rb[i] = ntt::mulmod(bi, bi, p, mu) as u32;
+            rab[i] = ntt::mulmod(ai, bi, p, mu) as u32;
         }
 
         // Two forked inverses + one inline, as in `fibDoubleNTT`.
@@ -404,10 +403,10 @@ impl BigInt {
         let n = 1usize << log_n;
 
         // Fresh zeroed buffers per track (no pooled garbage to mistrust).
-        let mut fa0 = vec![0u64; n];
-        let mut fb0 = vec![0u64; n];
-        Self::fill_u64(a, &mut fa0);
-        Self::fill_u64(b, &mut fb0);
+        let mut fa0 = vec![0u32; n];
+        let mut fb0 = vec![0u32; n];
+        Self::fill_u32(a, &mut fa0);
+        Self::fill_u32(b, &mut fb0);
         // One buffer pair per prime (Java does the same two `arraycopy`s).
         let (fa1, fa2) = (fa0.clone(), fa0.clone());
         let (fb1, fb2) = (fb0.clone(), fb0.clone());
