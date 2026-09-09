@@ -230,7 +230,6 @@ impl BigInt {
         let p1 = ntt::P1;
         let p2 = ntt::P2;
         let p3 = ntt::P3;
-        let inv_p2 = ntt::INV_P2;
         let inv_p3 = ntt::INV_P3;
         let p1_inv_p2 = p1_inv_p2();
         let p12_inv_p3 = p12_inv_p3();
@@ -249,7 +248,7 @@ impl BigInt {
             // (wrong whenever the float quotient estimate errs by 1). Exact
             // Euclidean reduction here is O(1) and always right.
             let diff2 = (r2[i] as i64 - v1 as i64).rem_euclid(p2 as i64) as u64;
-            let v2 = ntt::mulmod(diff2, p1_inv_p2, p2, inv_p2);
+            let v2 = ntt::mulmod(diff2, p1_inv_p2, p2, ntt::MU_P2);
 
             let partial = v1 + p1 * v2;
             // partial % p3 via Barrett (double), corrected twice for safety.
@@ -270,7 +269,7 @@ impl BigInt {
             if diff3 < 0 {
                 diff3 += p3 as i64;
             }
-            let v3 = ntt::mulmod(diff3 as u64, p12_inv_p3, p3, inv_p3);
+            let v3 = ntt::mulmod(diff3 as u64, p12_inv_p3, p3, ntt::MU_P3);
 
             let acc0 = partial + carry;
             let lo = p1p2_lo * v3;
@@ -316,10 +315,10 @@ impl BigInt {
             ntt::ntt_forward(&mut fa, log_n, pi);
             ntt::ntt_forward(&mut fb, log_n, pi);
             let p = ntt::PRIMES[pi];
-            let pinv = [ntt::INV_P1, ntt::INV_P2, ntt::INV_P3][pi];
+            let mu = [ntt::MU_P1, ntt::MU_P2, ntt::MU_P3][pi];
             let mut r = vec![0u64; n];
             for i in 0..n {
-                r[i] = ntt::mulmod(fa[i], fb[i], p, pinv);
+                r[i] = ntt::mulmod(fa[i], fb[i], p, mu);
             }
             ntt::ntt_inverse(&mut r, log_n, pi);
             r
@@ -348,7 +347,7 @@ impl BigInt {
         pi: usize,
     ) -> (Vec<u64>, Vec<u64>, Vec<u64>) {
         let p = ntt::PRIMES[pi];
-        let pinv = [ntt::INV_P1, ntt::INV_P2, ntt::INV_P3][pi];
+        let mu = [ntt::MU_P1, ntt::MU_P2, ntt::MU_P3][pi];
         let n = fa.len();
 
         // Nested join mirrors Java's forked `forward fb` + inline `forward fa`.
@@ -368,9 +367,9 @@ impl BigInt {
         for i in 0..n {
             let ai = fa[i];
             let bi = fb[i];
-            ra[i] = ntt::mulmod(ai, ai, p, pinv);
-            rb[i] = ntt::mulmod(bi, bi, p, pinv);
-            rab[i] = ntt::mulmod(ai, bi, p, pinv);
+            ra[i] = ntt::mulmod(ai, ai, p, mu);
+            rb[i] = ntt::mulmod(bi, bi, p, mu);
+            rab[i] = ntt::mulmod(ai, bi, p, mu);
         }
 
         // Two forked inverses + one inline, as in `fibDoubleNTT`.

@@ -14,9 +14,12 @@
 //! Callers must enforce that limit (see [`MAX_LOG_N`]); Java silently wraps
 //! past it, we return an error instead.
 //!
-//! Optimisations carried over from the Java version:
-//! * Barrett-style reduction via a precomputed `1.0/p` double replaces every
-//!   `% p` in the butterfly (hardware `div` is ~20-40 cycles, this is ~5).
+//! Optimisations carried over from the Java version, then improved:
+//! * Integer Barrett reduction replaces every `% p` in the butterfly
+//!   (hardware `div` is ~20-40 cycles, this is a multiply-high plus fix-up).
+//!   Java used a `double`-based quotient estimate; we use a pure-integer one
+//!   (`q̂ = (x·μ) >> 64`, `μ = ⌈2^64/p⌉`) to avoid the `f64`→`u64` conversion
+//!   latency chain on the hottest loop.
 //! * Layered root-of-unity tables: the inner loop reads
 //!   `roots[len], roots[len+1], ...` sequentially (prefetcher-friendly) and
 //!   the per-butterfly `w = w * wlen % p` update disappears entirely.
@@ -35,12 +38,20 @@ const G: u64 = 3;
 
 pub const PRIMES: [u64; 3] = [P1, P2, P3];
 
-/// Precomputed `1.0 / p` for Barrett reduction.
-pub const INV_P1: f64 = 1.0 / P1 as f64;
-pub const INV_P2: f64 = 1.0 / P2 as f64;
-pub const INV_P3: f64 = 1.0 / P3 as f64;
+/// `⌈2^64 / p⌉` multipliers for integer Barrett reduction (one per prime).
+const fn barrett_mu(p: u64) -> u64 {
+    (1u128 << 64).div_ceil(p as u128) as u64
+}
 
-const INV_PRIMES: [f64; 3] = [INV_P1, INV_P2, INV_P3];
+pub const MU_P1: u64 = barrett_mu(P1);
+pub const MU_P2: u64 = barrett_mu(P2);
+pub const MU_P3: u64 = barrett_mu(P3);
+
+const MU_PRIMES: [u64; 3] = [MU_P1, MU_P2, MU_P3];
+
+/// `1.0 / P3`, kept for the one double-Barrett remainder left in Garner's
+/// `partial % P3` (`bigint.rs`), which is exact and off the hot path.
+pub const INV_P3: f64 = 1.0 / P3 as f64;
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, RwLock};
@@ -57,34 +68,36 @@ fn cache_key(log_n: u32, pi: usize) -> u32 {
     log_n * 3 + pi as u32
 }
 
-/// `(a * b) mod p` via Barrett reduction.
+/// `(a * b) mod p` via integer Barrett reduction.
 ///
 /// Preconditions: `a, b < 2^32` (NOT `< p` — the forward butterfly legitimately
 /// holds lazily-reduced sums up to `2^32 - 1`; see below), so `a*b < 2^64`
-/// fits in a `u64` with no 128-bit arithmetic. The double quotient estimate
-/// is off by at most 1: `x <= 2^64 - 1` rounds to `f64` with error `<= 4096`,
-/// so `(x * p_inv)` has absolute error `<= 4096 / 167772161 < 1e-4 << 1`.
-/// A single conditional add/subtract corrects it. All arithmetic stays in
-/// `u64` — this is a deliberate fix of a bug in `NTT.java`, whose signed
-/// `long x = a * b` silently overflows for products `>= 2^63` (entirely
-/// possible once residues exceed `2^31.5`), producing wrong residues and
-/// hence wrong Fibonacci numbers for NTT-sized inputs. See the write-up.
+/// fits in a `u64` with no 128-bit division. With `μ = ⌈2^64/p⌉`, the estimate
+/// `q̂ = ⌊x·μ/2^64⌋` is within ±1 of `⌊x/p⌋` for all `x < 2^64`
+/// (Möller–Granlund "Improved division by invariant integers"), so a single
+/// conditional add/subtract corrects it. Pure integer arithmetic — no `f64`
+/// quotient, no `cvttsd2si` latency chain — while staying exact, which is also
+/// what fixes the `NTT.java` signed-`long`-overflow bug by construction
+/// (see the write-up).
 ///
 /// Laziness argument (why sums `< 2^32` are fine): every butterfly output is
 /// congruent mod `p` to the true value (single subtract preserves congruence,
 /// differences are exact), and `mulmod` is exact for any inputs `< 2^32`, so
 /// by induction every stage output — and the final convolution — is exact.
 #[inline(always)]
-pub fn mulmod(a: u64, b: u64, p: u64, p_inv: f64) -> u64 {
+pub fn mulmod(a: u64, b: u64, p: u64, mu: u64) -> u64 {
     debug_assert!(
         a < (1u64 << 32) && b < (1u64 << 32),
         "mulmod inputs out of range"
     );
     let x = a * b;
-    let q = (x as f64 * p_inv) as u64;
-    let qp = q.wrapping_mul(p);
-    if qp <= x {
-        let r = x - qp;
+    let q = ((x as u128 * mu as u128) >> 64) as u64;
+    // `q·p` can exceed `u64` by up to `p` when `x` is near `2^64`, so compare
+    // in `u128` — a single widening multiply, still no division.
+    let qp = q as u128 * p as u128;
+    let x128 = x as u128;
+    if qp <= x128 {
+        let r = (x128 - qp) as u64;
         if r >= p {
             r - p
         } else {
@@ -93,9 +106,9 @@ pub fn mulmod(a: u64, b: u64, p: u64, p_inv: f64) -> u64 {
     } else {
         // `q` overestimated by (at most) 1: `qp - x <= p`, so `p - (qp - x)`
         // is the true remainder with no underflow.
-        let d = qp - x;
-        debug_assert!(d <= p, "Barrett estimate off by more than 1");
-        p - d
+        let d = qp - x128;
+        debug_assert!(d <= p as u128, "Barrett estimate off by more than 1");
+        (p as u128 - d) as u64
     }
 }
 
@@ -130,7 +143,7 @@ fn build_roots(log_n: u32, pi: usize, inverse: bool) -> Vec<u64> {
     if inverse {
         g = powmod(g, p - 2, p);
     }
-    let p_inv = INV_PRIMES[pi];
+    let mu = MU_PRIMES[pi];
 
     let mut rt = vec![0u64; n.max(2)];
     rt[1] = 1;
@@ -141,7 +154,7 @@ fn build_roots(log_n: u32, pi: usize, inverse: bool) -> Vec<u64> {
             rt[i] = if i & 1 == 0 {
                 rt[i >> 1]
             } else {
-                mulmod(rt[i - 1], e, p, p_inv)
+                mulmod(rt[i - 1], e, p, mu)
             };
         }
         k <<= 1;
@@ -225,7 +238,7 @@ pub fn ntt_forward(data: &mut [u64], log_n: u32, pi: usize) {
     }
     debug_assert_eq!(data.len(), 1usize << log_n);
     let p = PRIMES[pi];
-    let p_inv = INV_PRIMES[pi];
+    let mu = MU_PRIMES[pi];
     let rt = fwd_roots(log_n, pi);
     let n = 1usize << log_n;
 
@@ -238,7 +251,7 @@ pub fn ntt_forward(data: &mut [u64], log_n: u32, pi: usize) {
         while i < n {
             for j in 0..len {
                 let u = data[i + j];
-                let v = mulmod(data[i + j + len], rt[len + j], p, p_inv);
+                let v = mulmod(data[i + j + len], rt[len + j], p, mu);
                 let sum = u + v;
                 data[i + j] = if sum >= p { sum - p } else { sum };
                 data[i + j + len] = if u < v { u + p - v } else { u - v };
@@ -256,7 +269,7 @@ pub fn ntt_inverse(data: &mut [u64], log_n: u32, pi: usize) {
     }
     debug_assert_eq!(data.len(), 1usize << log_n);
     let p = PRIMES[pi];
-    let p_inv = INV_PRIMES[pi];
+    let mu = MU_PRIMES[pi];
     let rt = inv_roots(log_n, pi);
     let ni = n_inv(log_n, pi);
     let n = 1usize << log_n;
@@ -270,7 +283,7 @@ pub fn ntt_inverse(data: &mut [u64], log_n: u32, pi: usize) {
         while i < n {
             for j in 0..len {
                 let u = data[i + j];
-                let v = mulmod(data[i + j + len], rt[len + j], p, p_inv);
+                let v = mulmod(data[i + j + len], rt[len + j], p, mu);
                 let sum = u + v;
                 data[i + j] = if sum >= p { sum - p } else { sum };
                 data[i + j + len] = if u < v { u + p - v } else { u - v };
@@ -281,7 +294,7 @@ pub fn ntt_inverse(data: &mut [u64], log_n: u32, pi: usize) {
     }
 
     for v in data.iter_mut() {
-        *v = mulmod(*v, ni, p, p_inv);
+        *v = mulmod(*v, ni, p, mu);
     }
 }
 
@@ -302,10 +315,10 @@ mod tests {
         // `a, b < 2^32` (forward butterflies hold lazily-reduced sums that
         // big — testing only `< p` would miss the Java overflow regime).
         // Oracle is exact u128 arithmetic.
-        for &p in &PRIMES {
-            let inv = 1.0 / p as f64;
+        for (pi, &p) in PRIMES.iter().enumerate() {
+            let mu = MU_PRIMES[pi];
             let mut x = 1u64;
-            for _ in 0..5000 {
+            for _ in 0..20000 {
                 // Wrapping LCG (deliberate overflow — hence wrapping ops).
                 x = x
                     .wrapping_mul(6364136223846793005)
@@ -313,7 +326,20 @@ mod tests {
                 let a = x & 0xFFFF_FFFF;
                 let b = (x >> 11) & 0xFFFF_FFFF;
                 let want = ((a as u128 * b as u128) % p as u128) as u64;
-                assert_eq!(mulmod(a, b, p, inv), want, "p={p} a={a} b={b}");
+                assert_eq!(mulmod(a, b, p, mu), want, "p={p} a={a} b={b}");
+            }
+            // Edges: max product, near-2^63 wrap boundary, zeros and ones.
+            for (a, b) in [
+                (0xFFFF_FFFF, 0xFFFF_FFFF),
+                (p - 1, p - 1),
+                (0xFFFF_FFFF, p - 1),
+                (0, p - 1),
+                (1, 1),
+                (3_037_000_499, 3_037_000_499), // just under sqrt(2^63)
+                (3_037_000_500, 3_037_000_500), // just over sqrt(2^63)
+            ] {
+                let want = ((a as u128 * b as u128) % p as u128) as u64;
+                assert_eq!(mulmod(a, b, p, mu), want, "p={p} a={a} b={b}");
             }
         }
     }
