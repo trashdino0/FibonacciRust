@@ -1,0 +1,5 @@
+[build]
+# Machine-specific tuning (Ryzen 5 3600X / Zen 2): AVX2 + BMI2 everywhere,
+# including inside num-bigint and our u128 Barrett math. Binary is no longer
+# portable to pre-2013 CPUs — deliberate, see README benchmarks.
+rustflags = ["-C", "target-cpu=native"]
