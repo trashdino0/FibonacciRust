@@ -30,10 +30,6 @@ struct Args {
     #[arg(short = 'a', long = "average", default_value_t = 1)]
     runs: u32,
 
-    /// Warmup: RUNS,N (default when bare flag: 50,10000).
-    #[arg(short = 'w', long = "warmup", num_args = 0..=1, default_missing_value = "50,10000")]
-    warmup: Option<String>,
-
     /// Print F(n) to the console after calculation.
     #[arg(short = 'p', long = "print")]
     print: bool,
@@ -59,37 +55,11 @@ fn t_crit_95(df: usize) -> f64 {
     }
 }
 
-fn parse_warmup(s: &str) -> Result<(u32, u64)> {
-    let mut it = s.split(',');
-    let runs: u32 = it
-        .next()
-        .unwrap_or("50")
-        .trim()
-        .parse()
-        .context("warmup RUNS must be an integer")?;
-    let n: u64 = it
-        .next()
-        .unwrap_or("10000")
-        .trim()
-        .parse()
-        .context("warmup N must be an integer")?;
-    Ok((runs, n))
-}
-
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Pre-warm NTT tables so timed runs don't pay construction costs.
+    // Pre-warm NTT root tables so timed runs don't pay construction costs.
     ntt::prewarm();
-
-    if let Some(ref w) = args.warmup {
-        let (warmup_runs, warmup_n) = parse_warmup(w)?;
-        println!("Warming up: {warmup_runs} x F({warmup_n})");
-        for _ in 0..warmup_runs {
-            let _ = fib::compute_fib(warmup_n)?;
-        }
-        println!("Warmup complete.");
-    }
 
     println!("Calculating F({}) with Parallel NTT (Rust)...", args.n);
 

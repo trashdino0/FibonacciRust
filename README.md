@@ -8,7 +8,7 @@ against Python's exact big integers up to F(10⁷) (2,089,877 digits).
 
 ```bash
 cargo build --release
-./target/release/fibonacci-rust 1000000 -a 5 -w 20,10000
+./target/release/fibonacci-rust 1000000 -a 5
 ./target/release/fibonacci-rust 1000000 -p -s fib.txt
 ```
 
@@ -18,7 +18,6 @@ CLI mirrors the Java version:
 |------|---------|
 | `n` | index of the Fibonacci number |
 | `-a N`, `--average N` | run N times, print mean / 95% CI / stddev / skewness |
-| `-w [RUNS,N]`, `--warmup [RUNS,N]` | warmup runs first (bare flag = `50,10000`) |
 | `-p`, `--print` | print the full decimal result |
 | `-s FILE`, `--save FILE` | save the decimal result to a file |
 
@@ -47,10 +46,12 @@ for reference: 28.7 ms / 245 ms / 2.31 s / 4.53 s for
 
 ### Optimization log (measured, release build, same machine)
 
-Method: warmed release runs (`-a 3–5 -w …`), one change at a time, `cargo test`
+Method: warmed release runs (`-a 3–5`), one change at a time, `cargo test`
 plus full-output SHA256/modular verification after every change. No privileged
 profiler was available (Windows, unelevated), so phases were timed with
 temporary `Instant` guards (reverted afterwards) plus complexity analysis.
+(The old `--warmup` flag is gone: measured with/without at 10⁷ and 10⁸, run 1
+equals steady state — a JIT ritual with no effect on a Rust binary.)
 
 Phase profile at F(10⁷): compute 0.22 s = forward NTT 0.18 + inverse NTT
 0.26 + pointwise/Garner/alloc ≈ 0.06 (thread-seconds — NTT ≈ 85%, allocation
@@ -322,8 +323,7 @@ parallel via `par_chunks` and concatenate in order.
 
 ### 7. CLI + stats (`src/main.rs`)
 
-`clap` CLI (same flags as Java), NTT pre-warm before timing (like the Java
-static block), warmup loop, then mean / sample-stddev / t-based 95% CI
+`clap` CLI, NTT pre-warm before timing, then mean / sample-stddev / t-based 95% CI
 (df 1–30 table, 1.96 beyond — matches Commons-Math `TDistribution`) /
 moment skewness. Errors: `thiserror` enum (`FibError::TooLarge`) + `anyhow`
 context in `main`; capacity breaches are `assert!`s (programmer invariants,
@@ -335,7 +335,7 @@ proven in comments — the footgun-checked choice).
 fibonacci-rust/
 ├── Cargo.toml          (clap, rayon, thiserror, anyhow, mimalloc; release: lto, cg-units=1, native)
 └── src/
-    ├── main.rs         (CLI, warmup, stats, orchestration)
+    ├── main.rs         (CLI, stats, orchestration)
     ├── fib.rs          (fast-doubling loop + table tests + identity tests)
     ├── bigint.rs       (limbs, add/sub/double, schoolbook, garner, fib_double)
     ├── ntt.rs          (primes, Barrett mulmod, layered roots, DIT transforms)
