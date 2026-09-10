@@ -25,22 +25,24 @@ CLI mirrors the Java version:
 ## Benchmarks
 
 Machine: AMD Ryzen 5 3600X, 6 cores / 12 threads, Windows. Release build
-(`opt-level=3, lto=true, codegen-units=1`), warmed NTT tables, compute-only
-unless noted. Java: `fibonacci-1.0-SNAPSHOT.jar` on JDK 21.0.8, same machine.
+(`opt-level=3, lto=true, codegen-units=1`, `target-cpu=native`, PGO — see the
+optimization log for the exact recipe), warmed runs. Java:
+`fibonacci-1.0-SNAPSHOT.jar` on JDK 21.0.8, same machine.
 
 | n | decimal digits | Rust compute | Rust decimal | Java compute |
 |---|---------------|--------------|--------------|--------------|
-| 10⁴ | 2,090 | 0.2 ms | — | — |
-| 10⁵ | 20,899 | 5.6 ms | ~1 ms | ~5 ms steady-state |
-| 10⁶ | 208,988 | 20.9 ms | ~20 ms | **CRASHES** (`add: overflow`) |
-| 10⁷ | 2,089,877 | 159 ms | ~0.52 s | **CRASHES** (same bug) |
-| 5·10⁷ | ~10,449,382 | 1.77 s | — | **CRASHES** (same bug) |
-| 10⁸ | 20,898,764 | ~3.7–4.6 s | ~17 s | **CRASHES** (same bug) |
+| 10⁴ | 2,090 | 0.1 ms | — | — |
+| 10⁵ | 20,899 | 1.9 ms | ~1 ms | ~5 ms steady-state |
+| 10⁶ | 208,988 | 9.5 ms | ~16 ms | **CRASHES** (`add: overflow`) |
+| 10⁷ | 2,089,877 | ~75 ms | ~0.49 s | **CRASHES** (same bug) |
+| 5·10⁷ | ~10,449,382 | 0.88 s | — | **CRASHES** (same bug) |
+| 10⁸ | 20,898,764 | 1.68 s | ~14.5 s | **CRASHES** (same bug) |
 
-(Compute figures are means over 3–5 warmed runs; 10⁸ varies run-to-run under
-sustained all-core load. The Rust column already includes the optimizations
-below — pre-optimization compute was 28.7 ms / 245 ms / 2.31 s / 4.53 s for
-10⁶ / 10⁷ / 5·10⁷ / 10⁸.)
+(Compute figures are means over 3–5 warmed runs. End-to-end at 10⁸:
+~16.2 s vs ~20.0 s before optimization (1.23×) — decimal conversion dominates
+there and has no available lever (see log). At 10⁷: 0.83 → 0.57 s (1.46×);
+at 10⁶: 48 → 26 ms (1.6×). Original pre-optimization compute for reference:
+28.7 ms / 245 ms / 2.31 s / 4.53 s for 10⁶ / 10⁷ / 5·10⁷ / 10⁸.)
 
 ### Optimization log (measured, release build, same machine)
 
@@ -67,13 +69,60 @@ churn ≈ 2%, so pooling/allocator swaps were skipped on evidence); decimal
    Head-to-head showed our single multiply (126 ms @100k limbs) trailing
    num-bigint's Karatsuba (94 ms) — our 3-prime NTT constants only pay off at
    larger sizes. Reverted in full; lesson preserved here instead of in code.
-3. **Not pursued, with reasons:** `ibig::to_string` as decimal backend
-   (846 ms vs our parallel 621 ms @10⁷ — its Display doesn't beat parallel
-   D&C); Barrett division for the top `div_rem` (≈3 mults + Newton-μ ≈ 10
-   mults ≈ 780 ms vs current 250 ms — needs a faster multiply first, see 2);
-   GMP/`rug` (no C toolchain on this machine — no vcpkg/MSYS/MinGW);
-   cache-blocked NTT and buffer pooling (profile says bandwidth-bound with
-   negligible alloc share — diminishing returns, stated plainly).
+ 3. **Not pursued after Round 1, with reasons:** `ibig::to_string` as decimal backend
+    (846 ms vs our parallel 621 ms @10⁷ — its Display doesn't beat parallel
+    D&C); Barrett division for the top `div_rem` (≈3 mults + Newton-μ ≈ 10
+    mults ≈ 780 ms vs current 250 ms — needs a faster multiply first, see 2);
+    GMP/`rug` (no C toolchain on this machine — no vcpkg/MSYS/MinGW);
+    cache-blocked NTT and buffer pooling (profile says bandwidth-bound with
+    negligible alloc share — diminishing returns, stated plainly).
+
+### Round 2 log (same method; light load budget: dev at ≤1M, verdicts at 10M)
+
+4. **`target-cpu=native` (kept): ~1.7× compute, zero source risk.** One-line
+   `.cargo/config.toml`; generic x86-64 was starving AVX2/BMI2 everywhere
+   (our u128 Barrett, num-bigint's u64 kernels). Compute @10⁷: 159→94 ms;
+   decimal unchanged (division doesn't vectorize). Binary is now
+   machine-specific — deliberate.
+5. **PGO (kept): ~6–8% compute.** `llvm-tools` + profile-generate → train
+   (`1M -a2` + `10M -s NUL`) → merge → profile-use. First attempt showed
+   +9% but overlapping CIs, so the final verdict came from an interleaved
+   A/B on finished code (alternating binaries, PGO won 8/8 pairs: 1M
+   9.6 vs 10.2 ms, 10M 74.5 vs 80.8 ms). Zero source risk. Recipe:
+   ```powershell
+   $env:RUSTFLAGS = "-C target-cpu=native -C profile-generate=$env:TEMP\pgo-data"
+   cargo build --release
+   .\target\release\fibonacci-rust.exe 1000000 -a 2
+   .\target\release\fibonacci-rust.exe 10000000 -s NUL
+   & "<toolchain>\lib\rustlib\x86_64-pc-windows-msvc\bin\llvm-profdata.exe" merge -o merged.profdata $env:TEMP\pgo-data
+   $env:RUSTFLAGS = "-C target-cpu=native -C profile-use=$env:TEMP\merged.profdata"
+   cargo build --release
+   ```
+   (Plain rebuilds without `RUSTFLAGS` silently drop PGO — re-run the recipe
+   after source changes. Profile data lives outside the repo; regenerate, don't
+   commit it.)
+6. **Tuning sweep (all null, reverted):** `RAYON_NUM_THREADS` 12 vs 6
+   (91 vs 96 ms — keep default), `PARALLEL_NTT_MIN_N` 4096 vs 16384
+   (no difference — join overhead negligible as predicted),
+   `TO_STRING_THRESHOLD_BITS` 15k/30k/60k (flat — keep 30k).
+7. **u32 NTT buffers (kept): ~1.2× compute.** Working arrays and root tables
+   `Vec<u64>` → `Vec<u32>` (values `< 2³²` by the laziness invariant;
+   arithmetic stays `u64`), halving streaming traffic — plus `fill` becomes a
+   `memcpy`. At 10⁸ the top transform's working set drops from 32 MB (spills
+   from L3) to 16 MB (fits), which is why 10⁸ compute improved
+   disproportionately (3.7 → 1.7 s). Compute @10⁷: 94→79 ms. Hash-identical
+   output.
+8. **Shift-split decimal division (reverted — no gain).** Idea: `10^k` divisor
+   = `2^k·5^k`, peel the power of two with a free shift+mask, BZ-divide by
+   the ~30%-smaller `5^k`. Measured 0.52→0.52 s — the O(n) shift/mask/or
+   passes and extra `5^k` pow eat the division saving. Reverted in full.
+9. **mimalloc (kept): ~10% decimal, tighter variance.** The parallel decimal
+   phase allocates heavily (immutable-BigUint style: fresh quotient/remainder
+   per `div_rem` across 12 threads). Decimal @10⁷: ~0.54 → ~0.49 s across
+   4 samples, and the run-to-run band tightened visibly. Compute unchanged,
+   as predicted (it barely allocates). Two-line change
+   (`mimalloc = "0.1"` + `#[global_allocator]`); MSVC `cl.exe` from the
+   installed VS 2022 toolchain builds the C sources fine.
 
 Correctness: full decimal strings hashed against Python (`hashlib.sha256`):
 F(10⁵), F(2·10⁵) (also vs Java where it runs), F(10⁶), F(10⁷) — all identical.

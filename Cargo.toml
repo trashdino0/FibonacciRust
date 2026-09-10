@@ -13,6 +13,9 @@ num-integer = "0.1"
 num-traits = "0.2"
 anyhow = "1"
 thiserror = "2"
+# EXPERIMENT (Step 5 candidate): secure-thread-local allocator for the
+# allocation-heavy parallel decimal phase. Keep iff decimal improves >=5%.
+mimalloc = "0.1"
 
 [profile.release]
 opt-level = 3

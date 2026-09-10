@@ -14,6 +14,10 @@ mod decimal;
 mod fib;
 mod ntt;
 
+// EXPERIMENT (Step 5 candidate): replace system allocator; see Cargo.toml.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::fs;
