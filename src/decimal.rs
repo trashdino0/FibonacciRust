@@ -10,12 +10,8 @@
 //! string  = to_string(high) + zero_padded_to_half(to_string(low))
 //! ```
 //!
-//! Both halves recurse **in parallel** via `rayon::join`. (The Java history is
-//! instructive: the original code converted the low half inline with a plain
-//! `BigInteger.toString()`, leaving half the work sequential; it was later
-//! fixed to recurse on both sides. We do the parallel split from the start.)
-//! Below [`TO_STRING_THRESHOLD`] bits we fall through to `to_string()`
-//! directly — splitting only pays off above ~9k digits.
+//! Both halves recurse **in parallel** via `rayon::join`.
+//! Below the threshold bits we fall through to `to_string()` directly.
 
 use crate::bigint::BigInt;
 use num_bigint::BigUint;
@@ -25,8 +21,7 @@ use std::collections::HashMap;
 use std::sync::{LazyLock, RwLock};
 
 /// Below this bit length, convert directly without splitting.
-/// (Java has two conflicting values — README says 50k, code says 30k.
-/// The code's 30k is the tuned one; we keep a single constant.)
+/// Single tuned threshold (30k bits ≈ 9k digits).
 pub const TO_STRING_THRESHOLD_BITS: usize = 30_000;
 
 static POW10_CACHE: LazyLock<RwLock<HashMap<u32, BigUint>>> =
@@ -43,8 +38,7 @@ fn pow10(exp: u32) -> BigUint {
         .clone()
 }
 
-/// `num-bigint` uses `u32` LE digits — exactly our limb layout — so this is
-/// one safe clone, replacing Java's `Unsafe`-poked `BigInteger` aliasing.
+/// `num-bigint` uses `u32` LE digits like our limbs: one safe clone.
 pub fn to_biguint(v: &BigInt) -> BigUint {
     if v.is_zero() {
         BigUint::zero()
@@ -104,7 +98,6 @@ mod tests {
 
     #[test]
     fn padding_is_correct() {
-        // F(100) = 354224848179261915075 — exercises multi-limb conversion.
         let v = crate::fib::compute_fib(100).unwrap();
         assert_eq!(to_decimal_string(&v), "354224848179261915075");
         assert_eq!(digit_count(&v), 21);

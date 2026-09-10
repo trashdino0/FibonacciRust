@@ -1,7 +1,6 @@
-//! Three-prime Number-Theoretic Transform (NTT), ported from `NTT.java`.
+//! Three-prime Number-Theoretic Transform (NTT) for exact convolution.
 //!
-//! Multiplication is convolution via NTT over three NTT-friendly primes,
-//! each < 2^30 so pairwise products fit in a `u64`:
+//! Each prime is `< 2^30` so pairwise products fit in a `u64`:
 //!
 //! | Prime | Value     | Factorisation   | Max transform |
 //! |-------|-----------|-----------------|---------------|
@@ -9,27 +8,13 @@
 //! | P2    | 167772161 | 5 * 2^25 + 1    | 2^25          |
 //! | P3    | 469762049 | 7 * 2^26 + 1    | 2^26          |
 //!
-//! All three share primitive root 3. The bottleneck is P1 (2^23), so results
-//! are exact for NTT sizes `n <= 2^23`, i.e. roughly `F(n)` with `n <= ~190M`.
-//! Callers must enforce that limit (see [`MAX_LOG_N`]); Java silently wraps
-//! past it, we return an error instead.
+//! All share primitive root 3. P1 caps exact sizes at `2^23` (≈F(190M));
+//! beyond that callers get an error, never wrapped garbage.
 //!
-//! Optimisations carried over from the Java version, then improved:
-//! * Integer Barrett reduction replaces every `% p` in the butterfly
-//!   (hardware `div` is ~20-40 cycles, this is a multiply-high plus fix-up).
-//!   Java used a `double`-based quotient estimate; we use a pure-integer one
-//!   (`q̂ = (x·μ) >> 64`, `μ = ⌈2^64/p⌉`) to avoid the `f64`→`u64` conversion
-//!   latency chain on the hottest loop.
-//! * Layered root-of-unity tables: the inner loop reads
-//!   `roots[len], roots[len+1], ...` sequentially (prefetcher-friendly) and
-//!   the per-butterfly `w = w * wlen % p` update disappears entirely.
-//! * NTT working arrays and root tables are `u32`, not `u64`: every stored
-//!   value is `< 2^32` by the laziness invariant, so this halves streaming
-//!   traffic (the top transform touches 16 MB instead of 32 MB per pass) while
-//!   all arithmetic still happens in `u64` locals.
-//! * Tables are built once and shared via `Arc` (Java used a
-//!   `ConcurrentHashMap`); cloning the `Arc` is pointer-sized, the tables
-//!   themselves are never copied.
+//! * Integer Barrett (`q̂ = (x·μ) >> 64`) instead of `% p` in the butterfly.
+//! * Layered root tables: sequential reads, no per-butterfly `w` update.
+//! * `u32` arrays/tables (values stay `< 2^32`): half the traffic, `u64` math.
+//! * Tables built once, shared via `Arc`.
 
 /// Bottleneck prime P1 supports transforms up to 2^23.
 pub const MAX_LOG_N: u32 = 23;
@@ -53,8 +38,7 @@ pub const MU_P3: u64 = barrett_mu(P3);
 
 const MU_PRIMES: [u64; 3] = [MU_P1, MU_P2, MU_P3];
 
-/// `1.0 / P3`, kept for the one double-Barrett remainder left in Garner's
-/// `partial % P3` (`bigint.rs`), which is exact and off the hot path.
+/// `1.0 / P3` for the one double-Barrett remainder left in `garner`.
 pub const INV_P3: f64 = 1.0 / P3 as f64;
 
 use std::collections::HashMap;
@@ -72,22 +56,15 @@ fn cache_key(log_n: u32, pi: usize) -> u32 {
     log_n * 3 + pi as u32
 }
 
-/// `(a * b) mod p` via integer Barrett reduction.
+/// `(a * b) mod p` via integer Barrett reduction. Requires `a, b < 2^32`
+/// (forward butterflies hold lazily-reduced sums that big); then `a*b < 2^64`
+/// and `q̂ = ⌊x·μ/2^64⌋` lands within ±1 of the quotient, so one fix-up
+/// corrects it. Exact for the full range — a signed 64-bit product here
+/// would wrap and corrupt residues.
 ///
-/// Preconditions: `a, b < 2^32` (NOT `< p` — the forward butterfly legitimately
-/// holds lazily-reduced sums up to `2^32 - 1`; see below), so `a*b < 2^64`
-/// fits in a `u64` with no 128-bit division. With `μ = ⌈2^64/p⌉`, the estimate
-/// `q̂ = ⌊x·μ/2^64⌋` is within ±1 of `⌊x/p⌋` for all `x < 2^64`
-/// (Möller–Granlund "Improved division by invariant integers"), so a single
-/// conditional add/subtract corrects it. Pure integer arithmetic — no `f64`
-/// quotient, no `cvttsd2si` latency chain — while staying exact, which is also
-/// what fixes the `NTT.java` signed-`long`-overflow bug by construction
-/// (see the write-up).
-///
-/// Laziness argument (why sums `< 2^32` are fine): every butterfly output is
-/// congruent mod `p` to the true value (single subtract preserves congruence,
-/// differences are exact), and `mulmod` is exact for any inputs `< 2^32`, so
-/// by induction every stage output — and the final convolution — is exact.
+/// Laziness is sound: every butterfly output stays congruent mod `p`
+/// (single subtract preserves it, differences are exact), so by induction
+/// every stage output — and the convolution — is exact.
 #[inline(always)]
 pub fn mulmod(a: u64, b: u64, p: u64, mu: u64) -> u64 {
     debug_assert!(
@@ -96,8 +73,7 @@ pub fn mulmod(a: u64, b: u64, p: u64, mu: u64) -> u64 {
     );
     let x = a * b;
     let q = ((x as u128 * mu as u128) >> 64) as u64;
-    // `q·p` can exceed `u64` by up to `p` when `x` is near `2^64`, so compare
-    // in `u128` — a single widening multiply, still no division.
+    // `q·p` can exceed `u64` near `x = 2^64`, so compare widened.
     let qp = q as u128 * p as u128;
     let x128 = x as u128;
     if qp <= x128 {
@@ -108,8 +84,7 @@ pub fn mulmod(a: u64, b: u64, p: u64, mu: u64) -> u64 {
             r
         }
     } else {
-        // `q` overestimated by (at most) 1: `qp - x <= p`, so `p - (qp - x)`
-        // is the true remainder with no underflow.
+        // Overestimated by ≤ 1: `p - (qp - x)` can't underflow.
         let d = qp - x128;
         debug_assert!(d <= p as u128, "Barrett estimate off by more than 1");
         (p as u128 - d) as u64
@@ -133,14 +108,9 @@ pub fn mod_inverse(n: u64, modu: u64) -> u64 {
     powmod(n, modu - 2, modu)
 }
 
-/// Layered root table for a DIT NTT of size `2^log_n`, stored as `u32`
-/// (every root is `< p < 2^30`).
-///
-/// Layout (`i` in `[1, 2^log_n)`): `roots[1] = 1`, and for each
-/// `k = 2, 4, 8, ..., n/2`: `roots[k] = roots[k/2]`,
-/// `roots[k+j] = roots[k+j-1] * e` for `j = 1..k`, where
-/// `e = g^((p-1)/(2k))` is the primitive `(2k)`-th root of unity.
-/// Inverse tables use `g^-1` as generator.
+/// Layered root table for a DIT NTT of size `2^log_n`, as `u32`
+/// (roots are `< p < 2^30`). Sequential reads per stage; inverse tables use
+/// `g^-1` as generator.
 fn build_roots(log_n: u32, pi: usize, inverse: bool) -> Vec<u32> {
     let n = 1usize << log_n;
     let p = PRIMES[pi];
@@ -167,7 +137,7 @@ fn build_roots(log_n: u32, pi: usize, inverse: bool) -> Vec<u32> {
     rt
 }
 
-/// Forward root table for size `2^log_n`, prime `pi` (shared `Arc`, cheap to clone).
+/// Forward root table for size `2^log_n`, prime `pi` (shared `Arc`).
 pub fn fwd_roots(log_n: u32, pi: usize) -> Arc<Vec<u32>> {
     let key = cache_key(log_n, pi);
     if let Some(hit) = FWD_CACHE.read().expect("lock").get(&key) {
@@ -207,8 +177,7 @@ pub fn n_inv(log_n: u32, pi: usize) -> u64 {
         .or_insert_with(|| powmod(1u64 << log_n, PRIMES[pi] - 2, PRIMES[pi]))
 }
 
-/// Pre-warm root tables for common sizes (mirrors the Java static block that
-/// warmed `logN 1..=20` for all 3 primes synchronously at startup).
+/// Pre-warm root tables for common sizes so timed runs skip construction.
 pub fn prewarm() {
     for log_n in 1..=20u32 {
         for pi in 0..3 {
@@ -219,7 +188,7 @@ pub fn prewarm() {
     }
 }
 
-/// Bit-reversal permutation, amortised O(n) via the binary-counter trick.
+/// Bit-reversal permutation via the binary-counter trick.
 fn bit_rev<T>(a: &mut [T]) {
     let n = a.len();
     let mut j = 0usize;
@@ -236,8 +205,7 @@ fn bit_rev<T>(a: &mut [T]) {
     }
 }
 
-/// Forward in-place NTT. `data` must have length exactly `2^log_n`.
-/// Stored values stay `< 2^32` (laziness invariant); arithmetic is `u64`.
+/// Forward in-place NTT over exactly `2^log_n` elements.
 pub fn ntt_forward(data: &mut [u32], log_n: u32, pi: usize) {
     if log_n == 0 {
         return;
@@ -304,7 +272,7 @@ pub fn ntt_inverse(data: &mut [u32], log_n: u32, pi: usize) {
     }
 }
 
-/// `ceil(log2(x))` for `x >= 1`: smallest `l` with `2^l >= x`.
+/// Smallest `l` with `2^l >= x` (`x >= 1`).
 #[inline]
 pub fn ceil_log2(x: usize) -> u32 {
     assert!(x >= 1, "ceil_log2(0) is undefined");
@@ -317,15 +285,13 @@ mod tests {
 
     #[test]
     fn mulmod_matches_remainder() {
-        // Spot-check across all three primes over the FULL contract range
-        // `a, b < 2^32` (forward butterflies hold lazily-reduced sums that
-        // big — testing only `< p` would miss the Java overflow regime).
-        // Oracle is exact u128 arithmetic.
+        // Full contract range `a, b < 2^32` against exact u128 arithmetic
+        // (butterflies legitimately hold values that big).
         for (pi, &p) in PRIMES.iter().enumerate() {
             let mu = MU_PRIMES[pi];
             let mut x = 1u64;
             for _ in 0..20000 {
-                // Wrapping LCG (deliberate overflow — hence wrapping ops).
+                // Wrapping LCG on purpose.
                 x = x
                     .wrapping_mul(6364136223846793005)
                     .wrapping_add(1442695040888963407);
@@ -334,7 +300,7 @@ mod tests {
                 let want = ((a as u128 * b as u128) % p as u128) as u64;
                 assert_eq!(mulmod(a, b, p, mu), want, "p={p} a={a} b={b}");
             }
-            // Edges: max product, near-2^63 wrap boundary, zeros and ones.
+            // Edges around the old signed-64 overflow boundary.
             for (a, b) in [
                 (0xFFFF_FFFF, 0xFFFF_FFFF),
                 (p - 1, p - 1),

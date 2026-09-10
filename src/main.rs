@@ -1,13 +1,4 @@
 //! `fibonacci-rust` — huge Fibonacci numbers via fast doubling + 3-prime NTT.
-//!
-//! CLI mirrors `fibonacciV2` (`HugeFibonacciMutable`):
-//! ```text
-//! fibonacci-rust [OPTIONS] <N>
-//!   -a, --average <N>     run N times and print statistics
-//!   -w, --warmup [R,N]    warmup RUNS iterations of F(N) first (default 50,10000)
-//!   -p, --print           print the full decimal result
-//!   -s, --save <FILE>     save the decimal result to a file
-//! ```
 
 mod bigint;
 mod decimal;
@@ -53,7 +44,6 @@ struct Args {
 }
 
 /// Two-sided 95% t critical values, df = 1..=30, then normal 1.96.
-/// (Matches Java's `TDistribution.inverseCumulativeProbability(0.975)`.)
 fn t_crit_95(df: usize) -> f64 {
     const T: [f64; 30] = [
         12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228, 2.201, 2.179, 2.160,
@@ -89,8 +79,7 @@ fn parse_warmup(s: &str) -> Result<(u32, u64)> {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Pre-warm NTT root tables (like the Java static block) so the timed
-    // runs don't pay table-construction costs.
+    // Pre-warm NTT tables so timed runs don't pay construction costs.
     ntt::prewarm();
 
     if let Some(ref w) = args.warmup {
@@ -124,7 +113,6 @@ fn main() -> Result<()> {
         let sd = var.sqrt();
         let crit = t_crit_95(times.len() - 1);
         let moe = crit * (sd / n.sqrt());
-        // Skewness (moment estimator, like Commons Math).
         let skew = if sd > 0.0 {
             times.iter().map(|t| ((t - mean) / sd).powi(3)).sum::<f64>() / n
         } else {

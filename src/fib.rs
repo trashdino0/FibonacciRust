@@ -16,24 +16,14 @@ const FIB_BASE: [u64; 17] = [
 ];
 
 /// `log2(phi)` — `F(n)` has about `n * LOG2_PHI` bits.
-const LOG2_PHI: f64 = 0.694_241_913_630_617_8;
-
 /// Compute `F(target)`.
 ///
 /// Small operands use the schoolbook doubling step, large ones the 3-product
-/// NTT step. Returns [`FibError::TooLarge`] past the exact NTT limit instead
-/// of Java's silent wrap-around.
+/// NTT step. Past the exact NTT limit returns an error instead of garbage.
 pub fn compute_fib(target: u64) -> Result<BigInt, FibError> {
     if target < FIB_BASE.len() as u64 {
         return Ok(BigInt::from_u64(FIB_BASE[target as usize], 2));
     }
-
-    // Tight capacity story (a Java bug fixed here): Java estimated
-    // `estLimbs = n*0.022 + 32` then over-allocated `bufSize ~= 4x` that
-    // estimate "for headroom". We size every intermediate exactly
-    // (`next_pow2(2*max_len) + 2`) inside the doubling steps, so no global
-    // buffer — and no 2.4x profligate overallocation — is needed at all.
-    let _estimated_bits = (target as f64 * LOG2_PHI).ceil() as usize + 64;
 
     let msb = 63 - target.leading_zeros();
     let prefix_bits = (msb + 1).min(4);
@@ -50,8 +40,7 @@ pub fn compute_fib(target: u64) -> Result<BigInt, FibError> {
                 FibError::TooLarge(_, log_n) => FibError::TooLarge(target, log_n),
             })?
         };
-        // Bit set: advance (F(k), F(k+1)) -> (F(k+1), F(k)+F(k+1)).
-        // Reuse `na`'s allocation for the sum — no fresh alloc.
+        // Advance on set bits, reusing `na` for the sum (no fresh alloc).
         if (target >> i) & 1 == 1 {
             let mut next_b = na;
             next_b.add_assign(&nb);
@@ -69,7 +58,7 @@ pub fn compute_fib(target: u64) -> Result<BigInt, FibError> {
 mod tests {
     use super::*;
 
-    // First 31 Fibonacci numbers — table-driven, one test, failure names the case.
+    // First 31 Fibonacci numbers, checked in one table-driven test.
     const SMALL: [u64; 31] = [
         0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610, 987, 1597, 2584, 4181, 6765,
         10946, 17711, 28657, 46368, 75025, 121393, 196418, 317811, 514229, 832040,
@@ -111,7 +100,6 @@ mod tests {
 
     #[test]
     fn doubling_identity_holds() {
-        // For several k: fib_double(F(k),F(k+1)) == (F(2k),F(2k+1)).
         for k in [2u64, 3, 5, 50, 500, 5000] {
             let (fk, fk1) = (compute_fib(k).unwrap(), compute_fib(k + 1).unwrap());
             let (f2k, f2k1) = if fk.len() < NTT_THRESHOLD && fk1.len() < NTT_THRESHOLD {
