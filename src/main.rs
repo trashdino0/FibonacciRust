@@ -14,7 +14,8 @@ mod decimal;
 mod fib;
 mod ntt;
 
-// EXPERIMENT (Step 5 candidate): replace system allocator; see Cargo.toml.
+// mimalloc: ~10% faster parallel decimal phase (measured), tighter variance.
+// See README optimization log. Needs VS 2022 cl.exe at build time.
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
