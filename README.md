@@ -33,16 +33,17 @@ optimization log for the exact recipe), warmed runs. Java:
 |---|---------------|--------------|--------------|--------------|
 | 10⁴ | 2,090 | 0.1 ms | — | — |
 | 10⁵ | 20,899 | 1.9 ms | ~1 ms | ~5 ms steady-state |
-| 10⁶ | 208,988 | 9.5 ms | ~16 ms | **CRASHES** (`add: overflow`) |
-| 10⁷ | 2,089,877 | ~75 ms | ~0.49 s | **CRASHES** (same bug) |
-| 5·10⁷ | ~10,449,382 | 0.88 s | — | **CRASHES** (same bug) |
-| 10⁸ | 20,898,764 | 1.68 s | ~14.5 s | **CRASHES** (same bug) |
+| 10⁶ | 208,988 | 9.0 ms | ~15 ms | **CRASHES** (`add: overflow`) |
+| 10⁷ | 2,089,877 | ~70 ms | ~0.45 s | **CRASHES** (same bug) |
+| 5·10⁷ | ~10,449,382 | 0.75 s | — | **CRASHES** (same bug) |
+| 10⁸ | 20,898,764 | 1.77 s | ~14.3 s | **CRASHES** (same bug) |
 
 (Compute figures are means over 3–5 warmed runs. End-to-end at 10⁸:
-~16.2 s vs ~20.0 s before optimization (1.23×) — decimal conversion dominates
-there and has no available lever (see log). At 10⁷: 0.83 → 0.57 s (1.46×);
-at 10⁶: 48 → 26 ms (1.6×). Original pre-optimization compute for reference:
-28.7 ms / 245 ms / 2.31 s / 4.53 s for 10⁶ / 10⁷ / 5·10⁷ / 10⁸.)
+~16.0 s vs ~20.0 s before optimization (1.25×); at 10⁷: 0.83 → 0.52 s
+(1.6×); at 10⁶: 48 → 24 ms (2.0×). Decimal conversion dominates at scale
+and survived every attack below — see log. Original pre-optimization compute
+for reference: 28.7 ms / 245 ms / 2.31 s / 4.53 s for
+10⁶ / 10⁷ / 5·10⁷ / 10⁸.)
 
 ### Optimization log (measured, release build, same machine)
 
@@ -123,6 +124,37 @@ churn ≈ 2%, so pooling/allocator swaps were skipped on evidence); decimal
    as predicted (it barely allocates). Two-line change
    (`mimalloc = "0.1"` + `#[global_allocator]`); MSVC `cl.exe` from the
    installed VS 2022 toolchain builds the C sources fine.
+
+### Round 3 log: custom Barrett division (built, verified, reverted)
+
+10. **Barrett `div_rem` with Newton reciprocal (reverted — measured 3–4×
+    worse).** Motivated by fresh evidence (our NTT multiply had become ~5×
+    num-bigint's at 166k limbs), this was a full implementation, not a
+    sketch: new `src/div.rs` (~400 lines) with word-doubling Newton reciprocal
+    (u128-division seed), verify-by-property reciprocal finalization, and a
+    bulletproof correction-loop Barrett core (exact from ANY estimate —
+    proven terminating, verified by differential tests against constructed
+    `u = q·d + r` oracles plus a 104k-digit end-to-end conversion oracle).
+    Debugging it also fixed two real bugs along the way (an off-by-`b` slice
+    in reciprocal finalization, caught by concrete example; an iteration-count
+    shortfall for small `n`, caught by the tests' correction-count asserts).
+    The finished, correct implementation then lost on the clock at every size
+    (1M: 0.020→0.087 s; 5M: ~0.2→0.85 s; 10M: 0.52→1.88 s decimal) and was
+    reverted in full — nothing of it remains in the tree (see git history).
+    Two root causes, both measured:
+    - *Per-node divisor explosion:* halves differ per node, so the tree built
+      ~50 distinct Newton reciprocals per run instead of ~8 (measured with a
+      counter) — canonical per-depth halves plus `OnceLock` dedup fixed the
+      count but not the outcome.
+    - *Nested-parallelism contention collapse:* Barrett mults parallelize via
+      nested rayon joins *inside* an already-parallel tree; at 10⁷ the
+      conversion hung past 600 s that way, while serial-inner mults finished
+      (slowly). Parallelize at exactly one level — the outermost — or pay
+      orders of magnitude, not percent.
+    Standing lesson: their Burnikel-Ziegler division is ~3 mults at these
+    sizes while ours needs ~6 (Newton-μ amortization fails with one division
+    per divisor). beating it needs truncated (middle-product) multiplies,
+    which is a project of its own — explicitly out of scope.
 
 Correctness: full decimal strings hashed against Python (`hashlib.sha256`):
 F(10⁵), F(2·10⁵) (also vs Java where it runs), F(10⁶), F(10⁷) — all identical.
