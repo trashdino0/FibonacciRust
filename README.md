@@ -156,15 +156,29 @@ churn ≈ 2%, so pooling/allocator swaps were skipped on evidence); decimal
     per divisor). beating it needs truncated (middle-product) multiplies,
     which is a project of its own — explicitly out of scope.
 
+### Round 4 log: decimal limbs end-to-end (kept — ~10× end-to-end at 10⁸)
+
+11. **Base-10⁹ limbs everywhere (kept): conversion deleted.** Instead of
+    fighting division throughput, every limb became a 9-digit group: NTT
+    inputs only need values `< 2³²` (10⁹ qualifies), max convolution
+    coefficients (`n·(10⁹)² ≈ 2^81.7` at top size) stay far below CRT
+    capacity (`≈ 2^86.3`), and Garner emits decimal digits directly (one
+    Barrett divmod per coefficient, ~20 cycles). Printing is then
+    zero-padded formatting — O(n), parallel over limb blocks. Rewrote
+    add/sub/double/`from_u64`/schoolbook (u128 accumulators) for decimal
+    carry; `num-bigint`/`num-integer` left `[dependencies]` entirely
+    (test oracles use hardcoded strings now). Compute slowed ~17%
+    (normalization overhead), decimal went 14.3 s → 7 ms @10⁸.
+    Verified: 17 tests + F(10⁶)/F(10⁷)/F(10⁸) hashes identical
+    (`AEF6…`/`DEE6…`/`098AC40F…`).
+
 Correctness: full decimal strings hashed against Python (`hashlib.sha256`):
-F(10⁵), F(2·10⁵) (also vs Java where it runs), F(10⁶), F(10⁷) — all identical.
-F(10⁸) verified by exact digit count (20,898,764) plus F(10⁸) mod five
-independent moduli (1,000,000,007 / 1,000,000,009 / 998,244,353 / 167,772,161 /
-10¹⁸+3) computed by an independent Python fast-doubling implementation — all
-match (false-pass odds ≈ 2⁻²⁰⁰).
-Plus 15 `cargo test` unit tests (NTT round-trips, `mulmod` vs `u128` oracle
-over the full `< 2³²` input range, schoolbook vs NTT cross-checks, known
-F(100)/F(1000) values, doubling identities).
+F(10⁵), F(2·10⁵) (also vs Java where it runs), F(10⁶), F(10⁷), F(10⁸) — all
+identical across every optimization round (final hashes: `AEF6…` @10⁶,
+`DEE6…` @10⁷, `098AC40F…` @10⁸).
+Plus 17 `cargo test` unit tests (NTT round-trips, `mulmod` vs `u128` oracle
+over the full `< 2³²` input range, schoolbook vs NTT cross-checks, `divmod_1e9`
+vs `%`, known F(100)/F(1000) values, doubling identities, chunk reassembly).
 
 ## Bugs found in fibonacciV2 (all fixed here)
 
@@ -197,9 +211,8 @@ branch. Fix: exact `rem_euclid` (O(1), always right).
 
 **3. `Unsafe`-poked `BigInteger` aliasing.** `MutableBigInt.toBigIntegerFast`
 hand-builds a `BigInteger` via `sun.misc.Unsafe` field offsets — brittle
-across JDK releases. Fix: our limb layout (`Vec<u32>` LE) already matches
-`num-bigint`'s, so conversion is one safe clone. No `unsafe` anywhere in
-this crate.
+across JDK releases. Fix: no `Unsafe` anywhere in this crate (limbs convert
+through plain clones where a bridge is ever needed).
 
 **4. Buffer over-allocation + parallel-pool oversubscription.** Java sizes one
 global `bufSize ≈ 4×` the estimate and caps every iteration buffer at it
@@ -233,9 +246,9 @@ two classic speedups:
    (< 2048 bits) use plain schoolbook multiplication — NTT overhead isn't
    worth it there.
 
-Printing 2M digits is its own problem (naive repeated division is
-quadratic), so decimal conversion recursively splits the number in half
-(`high · 10^half + low`) and converts both halves **in parallel**.
+3. **Decimal limbs (no conversion step).** Limbs are base-10⁹ digits, so
+   printing is just zero-padded formatting of each limb — the old
+   divide-and-conquer conversion (14 s at 10⁸) is gone entirely.
 
 ## How it works — detailed version
 
@@ -249,12 +262,12 @@ MSB to LSB: double `(a,b) → (F(2m), F(2m+1))`; if the bit is 1, advance
 
 ### 2. Limb representation (`src/bigint.rs`)
 
-`BigInt { mag: Vec<u32>, len: usize }`: unsigned 32-bit limbs, little-endian
-(`mag[0]` = least significant), `len` = used limbs, `mag[len..]` always zero.
-Add/sub/shift are textbook carry/borrow loops. Capacities: schoolbook
-products allocate `len + 2` spare limbs (proven room for the fused shift+add
-of the doubling step); NTT products allocate `n + 2` where `n` is the
-transform size (room for the CRT carry, which extends ≤ 2 limbs).
+`BigInt { mag: Vec<u32>, len: usize }`: base-10⁹ limbs, little-endian
+(`mag[0]` = least-significant 9 digits), `len` = used limbs. Add/sub/double
+are textbook carry/borrow loops over decimal digits. Capacities: schoolbook
+products allocate `len + 2` spare limbs (room for the fused double+add
+of the doubling step); NTT products allocate `n + 4` where `n` is the
+transform size (room for the CRT carry drain, ≤ 2 limbs).
 
 ### 3. NTT over three primes (`src/ntt.rs`)
 
@@ -265,10 +278,9 @@ size), so we transform mod three NTT-friendly primes
 `998244353 (2²³)`, `167772161 (2²⁵)`, `469762049 (2²⁶)` (all primitive root 3;
 P1 caps exact sizes at `n ≤ 2²³`) and reconstruct each coefficient with
 Garner's CRT. Details that matter:
-- **Barrett `mulmod`**: `q ≈ (a·b)/p` via precomputed `1.0/p` double, one
-  conditional fix-up. Replaces `div` (~20–40 cycles) with multiply+adjust
-  (~5). Valid over the full `a,b < 2³²` contract (quotient error `< 1e−4`;
-  both over/under-estimate self-correct — proven in comments).
+- **Barrett `mulmod`**: `q̂ = (x·μ) >> 64` with `μ = ⌈2⁶⁴/p⌉`, pure integer
+  (no float conversion on the hot loop), one conditional fix-up. Valid over
+  the full `a,b < 2³²` contract — proven in comments.
 - **Layered roots**: `roots[1]=1`, `roots[k+j]` laid out so each butterfly
   stage reads sequentially (prefetcher-friendly) and the per-butterfly
   `w·wlen` update vanishes. Tables shared via `Arc` (clone = pointer copy).
@@ -286,7 +298,7 @@ Garner's CRT. Details that matter:
 The doubling needs `A=a²`, `B=b²`, `C=a·b` from one `(fa, fb)` transform pair
 per prime (3 forward transforms saved per step vs separate multiplies), then
 `F(2k+1) = A+B`, `F(2k) = 2C−A`. Ownership does the buffer management Java's
-`Workspace` did by hand: each track *moves* its `Vec<u64>`s into the Rayon
+`Workspace` did by hand: each track *moves* its `Vec<u32>`s into the Rayon
 closure and returns the residues — no pool, no `NoClear` garbage class, no
 use-after-release possible. Small operands (`< 64` limbs) take the
 schoolbook path (`fib_double_small`).
@@ -295,16 +307,18 @@ schoolbook path (`fib_double_small`).
 
 Per coefficient: `v1 = r1`; `v2 = (r2−r1)·P1⁻¹ mod P2` (exact Euclidean
 reduction — bug-2 fix); `t = (v1+P1·v2) mod P3` (double-Barrett, double
-corrected); `v3 = (r3−t)·(P1P2)⁻¹ mod P3`; accumulate
-`v1 + P1·v2 + P1P2·v3` into base-2³² words with 64-bit carry. Precomputed:
-`P1·P2`, both modular inverses, and the `P1P2` lo/hi 32-bit split.
+corrected); `v3 = (r3−t)·(P1P2)⁻¹ mod P3`; then the full value
+`v1 + P1·v2 + P1P2·v3` (+ carry, exact in `u128`) emits one base-10⁹ digit
+via Barrett divmod, carrying the quotient. Max coefficient at top size is
+`n·(10⁹)² ≈ 2^81.7`, far below CRT capacity `≈ 2^86.3`. Precomputed:
+`P1·P2`, both modular inverses, and the `÷10⁹` Barrett constant.
 
-### 6. Parallel decimal (`src/decimal.rs`)
+### 6. Decimal output (`src/decimal.rs`)
 
-`digits ≈ bits·log₁₀(2)+1`; split `n = high·10^half + low` with one big
-`div_rem`, recurse both halves with `rayon::join`, zero-pad `low` to `half`
-digits. Below 30,000 bits, plain `to_string()`. `10^half` cached. The
-`BigUint` bridge is one clone (identical limb layout).
+There is no conversion step: limbs already are 9-digit groups, so output is
+top limb plain plus every lower limb zero-padded to exactly 9 digits
+(manual digit loop, no `format!` overhead). Lower-limb blocks format in
+parallel via `par_chunks` and concatenate in order.
 
 ### 7. CLI + stats (`src/main.rs`)
 
@@ -319,13 +333,13 @@ proven in comments — the footgun-checked choice).
 
 ```text
 fibonacci-rust/
-├── Cargo.toml          (clap, rayon, num-bigint, thiserror, anyhow; release: lto, cg-units=1)
+├── Cargo.toml          (clap, rayon, thiserror, anyhow, mimalloc; release: lto, cg-units=1, native)
 └── src/
     ├── main.rs         (CLI, warmup, stats, orchestration)
     ├── fib.rs          (fast-doubling loop + table tests + identity tests)
-    ├── bigint.rs       (limbs, add/sub/shift, schoolbook, garner, fib_double)
+    ├── bigint.rs       (limbs, add/sub/double, schoolbook, garner, fib_double)
     ├── ntt.rs          (primes, Barrett mulmod, layered roots, DIT transforms)
-    └── decimal.rs      (parallel base conversion)
+    └── decimal.rs      (parallel 9-digit formatting)
 ```
 
 No `unsafe`, no build script, no workspace (single binary — split only when a

@@ -68,23 +68,20 @@ mod tests {
     fn first_31_match_table() {
         for (n, &want) in SMALL.iter().enumerate() {
             let got = compute_fib(n as u64).unwrap();
-            let mut limbs = Vec::new();
-            let mut w = want;
-            while w > 0 {
-                limbs.push(w as u32);
-                w >>= 32;
-            }
-            assert_eq!(got.limbs(), &limbs, "F({n})");
+            // All fit in one base-10^9 limb.
+            let expected: &[u32] = if want == 0 { &[] } else { &[want as u32] };
+            assert_eq!(got.limbs(), expected, "F({n})");
         }
     }
 
     #[test]
     fn f100_matches_known_value() {
         let got = compute_fib(100).unwrap();
-        let want: Vec<u32> = num_bigint::BigUint::parse_bytes(b"354224848179261915075", 10)
-            .unwrap()
-            .to_u32_digits();
-        assert_eq!(got.limbs(), &want);
+        assert_eq!(
+            got.limbs(),
+            &[261915075, 224848179, 354],
+            "F(100) = 354|224848179|261915075 in base 10^9, LE"
+        );
     }
 
     #[test]
