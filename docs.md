@@ -196,6 +196,35 @@ change below was kept or reverted purely on measured numbers.
     Compute slowed ~17% (normalization overhead), decimal went 14.3 s → 7 ms
     @10⁸. Verified: 17 tests + F(10⁶)/F(10⁷)/F(10⁸) hashes identical.
 
+### Round 5: transform arithmetic (one kept threshold, three kills)
+
+12. **Schoolbook threshold 64 → 768 limbs (kept).** A head-to-head sweep
+    (schoolbook vs Karatsuba vs NTT, 64–8192 limbs) showed NTT's 9-transform
+    constant loses below ~700 limbs: at 512 schoolbook wins 1.5×, at 1024 NTT
+    is back ahead 1.4×. One-line change; small-n end-to-end improved
+    (10⁵: 2.1 → 1.5 ms, 10⁶: 11.7 → 10.7 ms native).
+13. **Karatsuba (built, tested, deleted).** Correct implementation with
+    differential tests — but the sweep above left it a useful band only
+    ~700–900 limbs wide (everywhere else schoolbook or NTT wins outright).
+    ~150 lines for ~0.05 ms end-to-end: deleted, threshold raise keeps nearly
+    all the gain.
+14. **4× loop unroll (reverted — no gain).** Extracted `butterfly()` + unrolled
+    the stage loop for ILP on the mulhi latency chain: 92.8 vs ~85 ms
+    (overlapping noise, if anything worse). LLVM had it covered.
+15. **Split-radix NTT (designed, spiked, killed by measurement).** The math
+    checks out (−25% mults, verified formulas) and a first implementation
+    even passed differential tests on first run — but measured **1.85×
+    slower** (16.3 vs 8.8 ms @262144 points): gather/scatter traffic plus
+    ~30k freelist operations per transform swamped the arithmetic saving.
+    Also killed on paper first: complex-packing (needs a conjugation
+    symmetry 𝔽ₚ doesn't have — proved impossible, not just slow) and
+    Stockham/blocking (roofline measured 4.5 GB/s vs ~40 GB/s: CPU-bound,
+    traffic tricks can't help).
+    Standing lesson: the remaining transform cost is ALU-throughput on scalar
+    integer ops (asm confirms: branchless BMI2, no vectorization). The only
+    unconquered lever is explicit SIMD (~1.3× possible, high complexity +
+    new dep) — deferred, poor ROI/risk at this point.
+
 ## Port notes: bugs found in fibonacciV2 (all fixed here)
 
 **1. Signed-overflow in `NTT.mulmod` corrupts results, then crashes.**

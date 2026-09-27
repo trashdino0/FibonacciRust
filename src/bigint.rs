@@ -20,8 +20,9 @@ pub enum FibError {
     TooLarge(u64, u32),
 }
 
-/// Below this many limbs (64 limbs ~= 2048 bits) schoolbook O(n^2) beats NTT.
-pub const NTT_THRESHOLD: usize = 64;
+/// Below this many limbs schoolbook O(n^2) beats NTT (measured crossover
+/// ≈ 700 limbs; NTT's 9-transform constant only pays off above it).
+pub const NTT_THRESHOLD: usize = 768;
 /// Below this NTT size, Rayon overhead exceeds the parallel gain.
 pub const PARALLEL_NTT_MIN_N: usize = 4096;
 
@@ -234,7 +235,7 @@ impl BigInt {
     // ------------------------------------------------------------------
 
     /// Schoolbook O(n^2) multiply. Wide `u128` row accumulators stay exact
-    /// (each holds `< 64·(10^9)^2 < 2^76` at threshold sizes); one normalize
+    /// (each holds `< 768·(10^9)^2 < 2^80` at threshold sizes); one normalize
     /// pass at the end, keeping 2 spare limbs for what follows the multiply.
     fn mul_schoolbook(a: &Self, b: &Self) -> Self {
         if a.len == 0 || b.len == 0 {
