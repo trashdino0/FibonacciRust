@@ -473,9 +473,27 @@ impl BigInt {
                 )
             };
 
-        let a2 = Self::garner(&a2_0, &a2_1, &a2_2, n);
-        let b2 = Self::garner(&b2_0, &b2_1, &b2_2, n);
-        let ab = Self::garner(&ab_0, &ab_1, &ab_2, n);
+        // The three Garner reconstructions are independent O(n) passes over
+        // disjoint residues — join them like the tracks above (serial below
+        // the threshold where join overhead would dominate instead).
+        let (a2, b2, ab) = if n < PARALLEL_NTT_MIN_N {
+            (
+                Self::garner(&a2_0, &a2_1, &a2_2, n),
+                Self::garner(&b2_0, &b2_1, &b2_2, n),
+                Self::garner(&ab_0, &ab_1, &ab_2, n),
+            )
+        } else {
+            let (x, (y, z)) = rayon::join(
+                || Self::garner(&a2_0, &a2_1, &a2_2, n),
+                || {
+                    rayon::join(
+                        || Self::garner(&b2_0, &b2_1, &b2_2, n),
+                        || Self::garner(&ab_0, &ab_1, &ab_2, n),
+                    )
+                },
+            );
+            (x, y, z)
+        };
 
         // NLL lets the borrow end before the move; no clone needed.
         // Garner leaves cap `n + 2` at `len <= n + 1`, so the doubling
