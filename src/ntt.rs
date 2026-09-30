@@ -206,6 +206,9 @@ fn bit_rev<T>(a: &mut [T]) {
 }
 
 /// Forward in-place NTT over exactly `2^log_n` elements.
+///
+/// Kept as the test-oracle path (production uses [`ntt_forward_dif`]).
+#[allow(dead_code)]
 pub fn ntt_forward(data: &mut [u32], log_n: u32, pi: usize) {
     if log_n == 0 {
         return;
@@ -237,7 +240,22 @@ pub fn ntt_forward(data: &mut [u32], log_n: u32, pi: usize) {
 }
 
 /// Inverse in-place NTT (includes `1/n` scaling).
+///
+/// Kept as the test-oracle path (production uses [`ntt_inverse_nobitrev`]).
+#[allow(dead_code)]
 pub fn ntt_inverse(data: &mut [u32], log_n: u32, pi: usize) {
+    ntt_inverse_core(data, log_n, pi, true);
+}
+
+/// Inverse in-place NTT for input already in bit-reversed order (as produced
+/// by [`ntt_forward_dif`]): skips the `bit_rev` pass, stages + `1/n` scaling
+/// only. Output is natural order, so downstream Garner/BigInt code is
+/// untouched — the permutation lives in the stage order, not in memory.
+pub fn ntt_inverse_nobitrev(data: &mut [u32], log_n: u32, pi: usize) {
+    ntt_inverse_core(data, log_n, pi, false);
+}
+
+fn ntt_inverse_core(data: &mut [u32], log_n: u32, pi: usize, bit_rev_first: bool) {
     if log_n == 0 {
         return;
     }
@@ -248,7 +266,9 @@ pub fn ntt_inverse(data: &mut [u32], log_n: u32, pi: usize) {
     let ni = n_inv(log_n, pi);
     let n = 1usize << log_n;
 
-    bit_rev(data);
+    if bit_rev_first {
+        bit_rev(data);
+    }
 
     let mut len = 1usize;
     while len < n {
@@ -269,6 +289,59 @@ pub fn ntt_inverse(data: &mut [u32], log_n: u32, pi: usize) {
 
     for v in data.iter_mut() {
         *v = mulmod(*v as u64, ni, p, mu) as u32;
+    }
+}
+
+/// Forward in-place NTT, decimation-in-frequency: natural order in,
+/// bit-reversed order out, with NO `bit_rev` pass.
+///
+/// Butterfly is `(u, v) -> (u+v, (u−v)·ω)` with `ω = rt[len+j]` — the same
+/// layered twiddle values as DIT, only the loop runs top-down (`len` from
+/// `n/2` down to 1). Pairs with [`ntt_inverse_nobitrev`]: the pointwise
+/// product between them is elementwise (order-preserving), so this pair
+/// deletes every `bit_rev` pass on the convolution path (2 forward + 3
+/// inverse per prime per doubling step) — a full random redistribution of
+/// streaming data each, far costlier than their `O(n)` appearance.
+///
+/// Strict `< 2p` discipline (DIT's lazy `< 2³²` doesn't transfer: DIF adds
+/// two stored values, so one operand is never a fresh reduced product):
+/// entry fully reduces each raw limb via `mulmod(·, 1)` — one sequential
+/// pass, no division — and every sum branch double-subtracts (`u+v < 4p`).
+/// The multiplied branch stays `< p` into `mulmod`, outputs `< p`.
+pub fn ntt_forward_dif(data: &mut [u32], log_n: u32, pi: usize) {
+    if log_n == 0 {
+        return;
+    }
+    debug_assert_eq!(data.len(), 1usize << log_n);
+    let p = PRIMES[pi];
+    let mu = MU_PRIMES[pi];
+    let rt = fwd_roots(log_n, pi);
+    let two_p = 2 * p;
+    let n = 1usize << log_n;
+
+    for v in data.iter_mut() {
+        *v = mulmod(*v as u64, 1, p, mu) as u32;
+    }
+
+    let mut len = n >> 1;
+    while len >= 1 {
+        let two = len << 1;
+        let mut i = 0usize;
+        while i < n {
+            for j in 0..len {
+                let u = data[i + j] as u64;
+                let vv = data[i + j + len] as u64;
+                // Sum branch: u+vv < 4p, two conditional subtracts -> < 2p.
+                let sum = u + vv;
+                let s1 = if sum >= p { sum - p } else { sum };
+                data[i + j] = (if s1 >= p { s1 - p } else { s1 }) as u32;
+                // Difference branch: exact mod p in < 2p, then scaled.
+                let dif = if u < vv { u + two_p - vv } else { u - vv };
+                data[i + j + len] = mulmod(dif, rt[len + j] as u64, p, mu) as u32;
+            }
+            i += two;
+        }
+        len >>= 1;
     }
 }
 
@@ -327,6 +400,77 @@ mod tests {
                 assert_ne!(v, orig, "forward should change data");
                 ntt_inverse(&mut v, log_n, pi);
                 assert_eq!(v, orig, "log_n={log_n} pi={pi}");
+            }
+        }
+    }
+
+    #[test]
+    fn dif_then_nobitrev_inverse_is_identity() {
+        // Full-u32 inputs (DIF entry must reduce raw limbs itself), plus
+        // residues near p (double-subtract edge) and tiny sizes.
+        for log_n in [0u32, 1, 2, 4, 8, 12] {
+            for (pi, &p) in PRIMES.iter().enumerate() {
+                let n = 1usize << log_n;
+                let mut x = 0x9E37_79B9u64;
+                let mut v = Vec::with_capacity(n);
+                for _ in 0..n {
+                    x = x
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    v.push((x & 0xFFFF_FFFF) as u32);
+                }
+                // Pin some lanes to the reduction edges.
+                if n > 0 {
+                    v[0] = u32::MAX;
+                    if n > 1 {
+                        v[1] = (p - 1) as u32;
+                    }
+                }
+                // Size 1 is pure identity in both paths (no entry reduction,
+                // like DIT); otherwise entry reduces, so expect residues.
+                let want: Vec<u32> = if n == 1 {
+                    v.clone()
+                } else {
+                    v.iter().map(|&a| (a as u64 % p) as u32).collect()
+                };
+                ntt_forward_dif(&mut v, log_n, pi);
+                ntt_inverse_nobitrev(&mut v, log_n, pi);
+                assert_eq!(v, want, "log_n={log_n} pi={pi}");
+            }
+        }
+    }
+
+    #[test]
+    fn dif_path_matches_dit_path() {
+        // Same convolution inputs through both paths must agree exactly
+        // (proves twiddle indexing + ordering, not just self-consistency).
+        for log_n in [2u32, 4, 8, 10] {
+            for (pi, &p) in PRIMES.iter().enumerate() {
+                let n = 1usize << log_n;
+                let a: Vec<u32> = (0..n as u64).map(|i| ((i * 13 + 5) % p) as u32).collect();
+                let b: Vec<u32> = (0..n as u64).map(|i| ((i * 29 + 3) % p) as u32).collect();
+                let mu = [MU_P1, MU_P2, MU_P3][pi];
+                // DIT reference: forward, pointwise, inverse.
+                let (mut fa, mut fb) = (a.clone(), b.clone());
+                ntt_forward(&mut fa, log_n, pi);
+                ntt_forward(&mut fb, log_n, pi);
+                let mut r: Vec<u32> = fa
+                    .iter()
+                    .zip(fb.iter())
+                    .map(|(&x, &y)| mulmod(x as u64, y as u64, p, mu) as u32)
+                    .collect();
+                ntt_inverse(&mut r, log_n, pi);
+                // DIF path: forward_dif, pointwise (same order), nobitrev inverse.
+                let (mut ga, mut gb) = (a.clone(), b.clone());
+                ntt_forward_dif(&mut ga, log_n, pi);
+                ntt_forward_dif(&mut gb, log_n, pi);
+                let mut s: Vec<u32> = ga
+                    .iter()
+                    .zip(gb.iter())
+                    .map(|(&x, &y)| mulmod(x as u64, y as u64, p, mu) as u32)
+                    .collect();
+                ntt_inverse_nobitrev(&mut s, log_n, pi);
+                assert_eq!(r, s, "log_n={log_n} pi={pi}");
             }
         }
     }

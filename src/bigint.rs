@@ -353,15 +353,15 @@ impl BigInt {
             let mut fb = vec![0u32; n];
             Self::fill_u32(a, &mut fa);
             Self::fill_u32(b, &mut fb);
-            ntt::ntt_forward(&mut fa, log_n, pi);
-            ntt::ntt_forward(&mut fb, log_n, pi);
+            ntt::ntt_forward_dif(&mut fa, log_n, pi);
+            ntt::ntt_forward_dif(&mut fb, log_n, pi);
             let p = ntt::PRIMES[pi];
             let mu = [ntt::MU_P1, ntt::MU_P2, ntt::MU_P3][pi];
             let mut r = vec![0u32; n];
             for i in 0..n {
                 r[i] = ntt::mulmod(fa[i] as u64, fb[i] as u64, p, mu) as u32;
             }
-            ntt::ntt_inverse(&mut r, log_n, pi);
+            ntt::ntt_inverse_nobitrev(&mut r, log_n, pi);
             r
         };
 
@@ -393,12 +393,12 @@ impl BigInt {
         // Fork `forward fb` alongside inline `forward fa`.
         if n >= PARALLEL_NTT_MIN_N {
             rayon::join(
-                || ntt::ntt_forward(&mut fa, log_n, pi),
-                || ntt::ntt_forward(&mut fb, log_n, pi),
+                || ntt::ntt_forward_dif(&mut fa, log_n, pi),
+                || ntt::ntt_forward_dif(&mut fb, log_n, pi),
             );
         } else {
-            ntt::ntt_forward(&mut fa, log_n, pi);
-            ntt::ntt_forward(&mut fb, log_n, pi);
+            ntt::ntt_forward_dif(&mut fa, log_n, pi);
+            ntt::ntt_forward_dif(&mut fb, log_n, pi);
         }
 
         let mut ra = vec![0u32; n];
@@ -415,18 +415,18 @@ impl BigInt {
         // Two forked inverses, one inline.
         if n >= PARALLEL_NTT_MIN_N {
             let ((), ()) = rayon::join(
-                || ntt::ntt_inverse(&mut ra, log_n, pi),
+                || ntt::ntt_inverse_nobitrev(&mut ra, log_n, pi),
                 || {
                     let ((), ()) = rayon::join(
-                        || ntt::ntt_inverse(&mut rb, log_n, pi),
-                        || ntt::ntt_inverse(&mut rab, log_n, pi),
+                        || ntt::ntt_inverse_nobitrev(&mut rb, log_n, pi),
+                        || ntt::ntt_inverse_nobitrev(&mut rab, log_n, pi),
                     );
                 },
             );
         } else {
-            ntt::ntt_inverse(&mut ra, log_n, pi);
-            ntt::ntt_inverse(&mut rb, log_n, pi);
-            ntt::ntt_inverse(&mut rab, log_n, pi);
+            ntt::ntt_inverse_nobitrev(&mut ra, log_n, pi);
+            ntt::ntt_inverse_nobitrev(&mut rb, log_n, pi);
+            ntt::ntt_inverse_nobitrev(&mut rab, log_n, pi);
         }
         (ra, rb, rab)
     }

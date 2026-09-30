@@ -225,6 +225,100 @@ change below was kept or reverted purely on measured numbers.
     unconquered lever is explicit SIMD (~1.3× possible, high complexity +
     new dep) — deferred, poor ROI/risk at this point.
 
+### Round 6: Montgomery reduction (units proved, production switch killed by A/B)
+
+16. **Montgomery `R = 2³²` domain (built, hash-verified, reverted).** Units
+    (`montmul`: two `u64` mults vs Barrett's two `u64` + `u128`-high;
+    `mont_in`/`mont_out_scaled`; Hensel `PP` + `R²` consts) passed a
+    3000-random × 3-prime differential test vs an independent `R⁻¹` oracle +
+    roundtrips — after fixing two test bugs of ours (the `p·PP ≡ −1` check
+    must mask to the low 32 bits; edge values must respect the `< p`
+    contract). Full integration (Montgomery twiddle caches,
+    `ntt_forward/inverse_mont` with strict `< p` discipline, entry as
+    `REDC(x·R²)` needing no pre-reduction, exit fused with the `1/n`
+    scaling, pointwise `montmul`) was hash-exact end to end (F(10M)
+    `DEE6…`, F(100M) `098A…`). Verdict by back-to-back stash A/B at the
+    target: Barrett 1.569 s vs Montgomery 1.609 s mean @100M (95% CIs fully
+    overlapping; 10M likewise flat) — **no win, reverted**. Why: ~⅓ cheaper
+    butterfly mults save ~3%, but the two added `O(n)` entry/exit streaming
+    passes cost ~3–4% traffic — net zero. Standing lesson, sharpening Round
+    5: Barrett's *lazy* reduction (raw `u32` limbs straight into the
+    butterflies, zero entry passes) is a structural traffic advantage — any
+    challenger must beat it *including* conversion cost, not just per-mult
+    ALU. Resurrection pointer: units + transforms deleted here live in git
+    history should entry/exit ever fuse into existing passes.
+
+### Round 7: profile-guided build + killing the bit-reversal passes (both kept)
+
+17. **PGO (kept, ~+4%).** Routine builds never used it (no `profile-use`
+    anywhere, no `.profdata` in tree). Pipeline: instrumented
+    (`-C profile-generate`), train (10M ×2 + 100M ×1), `llvm-profdata
+    merge`, rebuild (`-C profile-use`). Interleaved 10M: 72–74 ms vs
+    76–77 ms base. Cautionary data point: the first PGO 100M read 2.02 s
+    vs 1.57 s non-PGO — pure heat soak after the 40 s instrumented
+    training run, not a regression (interleaving proved it). Lesson holds:
+    never compare across sessions without re-measuring. Profile goes stale
+    on hot-loop edits — regenerate after code settles, not after every
+    spike (all code gates below run non-PGO for fairness).
+18. **DIF forward + `nobitrev` inverse (kept, ~−18% @100M).** Analysis:
+    bit-reversal of streaming data costs a full random redistribution
+    (~128 B/element with line amplification) — moving it (permuted
+    pointwise writes) or re-emitting it (inverse-DIF, whose bit-reversed
+    output would corrupt downstream positional BigInt arithmetic) both
+    fail; only absorbing the permutation *into the stage order* wins.
+    `ntt_forward_dif` (natural in, bit-reversed out, no `bit_rev`) pairs
+    with stageless-entry `ntt_inverse_nobitrev`; pointwise between them is
+    order-preserving. DIF needs strict `< 2p` discipline (sums of two
+    stored values — DIT's lazy `< 2³²` doesn't transfer): entry reduces via
+    one sequential `mulmod(·, 1)` pass, sums double-subtract. Same layered
+    twiddle table, same `rt[len+j]` indexing, loop top-down. Proven by two
+    new tests (full-`u32`/edge identity + DIF-path-matches-DIT-path), then
+    hash-exact end to end. 10M flat (cache-resident: bitrev is cheap in L3
+    there), 100M ABBA: 1.66 s → 1.37 s.     DIT forward + bit-reversed inverse
+    stay as the test-oracle path.
+
+### Round 8: radix-4 (correct first try, killed — heavier passes lose)
+
+19. **Radix-4 DIF/DIT (built, tested, deleted).** One radix-4 stage per two
+    radix-2 stages: same 4 mults per 4 elements, half the streaming passes,
+    dedicated triple-twiddle tables, directional `i` (`−i` for inverse —
+    derived, not guessed). Both new tests green on first run (identity +
+    full-path match incl. odd-size fallback). Verdict, both orders, both
+    regimes: 10M 93–99 ms vs 77–79 ms DIF (−25%, L3-resident), 100M 1.70 s
+    vs 1.42 s DIF (−20%, streaming). Half the passes yet slower everywhere:
+    post-DIF the bottleneck is the butterfly itself, and radix-4 lengthens
+    its dependent chains (triple-subtract sums, `i`-mult gating y1/y3),
+    doubles twiddle traffic, runs 8 concurrent streams in outer stages
+    (vs 4), and odd sizes stay radix-2 anyway (dilution). Same family as
+    the split-radix kill: pass count is not the cost — pass *weight* is.
+    Deleted per precedent; resurrection pointer in git history.
+
+### Round 9: exit fusion killed, entry fusion killed on paper
+
+20. **Fusing `1/n` into the last inverse stage (built, measured, reverted).**
+    Same mult count, one less streaming pass — modeled as a ~2% win.
+    Measured 10M: 122 ms vs 75 ms (**+65%**), base binary 74 ms same
+    session (not heat). Cause: the `if last` branch plus extra live values
+    (`ni`, staged outputs) perturb the hot loop's codegen in *every* stage
+    — spills/uop-cache pressure — and serialize two dependent mults into
+    the longest-stride stage; the standalone exit loop was perfectly
+    prefetchable streaming. Reverted; 75 ms recovered immediately.
+21. **Entry-into-`fill_u32` fusion (killed without building).** Same pattern
+    (fuse mults into an existing loop), same ~2% ceiling, same codegen
+    fragility just demonstrated. Standing lesson from both: the     butterfly
+    loops are finely balanced — micro-traffic fusions that touch hot loops
+    are guilty until proven innocent, and ~2% ceilings don't pay for the
+    risk.
+22. **PGO regenerated on settled code: neutral, routine stays non-PGO.**
+    Two fresh profiles on the DIF code (thin + rich training) both measured
+    ~0% across 6+ interleaved 10M pairs (75–82 ms either way), vs +4% on the
+    pre-DIF shape — PGO's payoff is code-shape-dependent, not a constant.
+    Verdict: keep the procedure documented, build routine non-PGO
+    (simpler, reproducible). Final state this session: plain
+    `cargo build --release` + `target-cpu=native`, 10M ≈ 75 ms,
+    100M ≈ 1.4 s (cool box; heat-soaked reads up to ~1.7 s — see
+    `learned.md` §8).
+
 ## Port notes: bugs found in fibonacciV2 (all fixed here)
 
 **1. Signed-overflow in `NTT.mulmod` corrupts results, then crashes.**

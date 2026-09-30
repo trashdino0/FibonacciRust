@@ -1,7 +1,7 @@
 # fibonacci-rust
 
 Compute huge Fibonacci numbers — exact, fast, with full decimal output.
-`F(10⁸)` (20,898,764 digits) in about 2 seconds on a 6-core desktop.
+`F(10⁸)` (20,898,764 digits) in about 1.5 seconds on a 6-core desktop.
 
 Fast doubling keeps the step count at `O(log n)`; NTT-based multiplication
 keeps each step at `O(m log m)`; base-10⁹ limbs make decimal output essentially
@@ -16,14 +16,14 @@ free. See [docs.md](docs.md) for algorithms, benchmarks history, and port notes.
 
 ## Performance
 
-AMD Ryzen 5 3600X (6C/12T), warmed runs, release+PGO build:
+AMD Ryzen 5 3600X (6C/12T), warmed runs, release build (`target-cpu=native`):
 
 | n | digits | compute | decimal | total |
 |---|--------|---------|---------|-------|
-| 10⁶ | 208,988 | 10 ms | ~0 ms | ~11 ms |
-| 10⁷ | 2,089,877 | 86 ms | ~1 ms | ~0.09 s |
-| 5·10⁷ | ~10,449,382 | 0.85 s | ~5 ms | ~0.85 s |
-| 10⁸ | 20,898,764 | 2.00 s | ~7 ms | ~2.0 s |
+| 10⁶ | 208,988 | 11 ms | ~0 ms | ~11 ms |
+| 10⁷ | 2,089,877 | 78 ms | ~1 ms | ~0.08 s |
+| 5·10⁷ | ~10,449,382 | 0.71 s | ~4 ms | ~0.72 s |
+| 10⁸ | 20,898,764 | 1.46 s | ~11 ms | ~1.5 s |
 
 ## Installation
 
